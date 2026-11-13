@@ -23,7 +23,9 @@ SDK2PY_REV=814556d15970dd2ecf1c9984e845ca02ab07e206
 CYCLONE_REV=5041f3560c088c99e5088b2b8520b69169621196         # releases/0.10.x (C lib 0.10.5)
 XRTELEOP_REV=817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b        # only for the G1 URDF (safety filter, IK)
 ASSETS_REV=55e40ff4705e1c6b26831862a6227839ac0e10d1         # HF dataset unitree_sim_isaaclab_usds
-export PIP_CONSTRAINT="$HERE/isaac-constraints.txt"           # pip freeze of the working env
+# pip freeze of the working env. Only for the steps after Isaac Lab: the freeze is not self-consistent (e.g.
+# psutil==7.2.2 vs isaacsim's psutil==5.9.8 and rl-games' psutil<6), so isaacsim/isaaclab can't resolve under it.
+CONSTRAINTS="$HERE/isaac-constraints.txt"
 export PIP_NO_CACHE_DIR=1 OMNI_KIT_ACCEPT_EULA=YES
 export CYCLONEDDS_HOME="$TP/cyclonedds/install"
 
@@ -118,6 +120,7 @@ step_cyclonedds() {
 
 step_repos() {
     activate
+    local -x PIP_CONSTRAINT="$CONSTRAINTS"
     clone_at https://github.com/unitreerobotics/unitree_sdk2_python.git "$TP/unitree_sdk2_python" "$SDK2PY_REV"
     pip install -e "$TP/unitree_sdk2_python"
     clone_at https://github.com/unitreerobotics/unitree_sim_isaaclab.git "$TP/unitree_sim_isaaclab" "$SIM_REV"
@@ -139,6 +142,7 @@ step_assets() {
 
 step_aalto() {
     activate
+    local -x PIP_CONSTRAINT="$CONSTRAINTS"
     pip install msgpack websockets                         # deploy protocol (versions from the constraints)
 }
 
