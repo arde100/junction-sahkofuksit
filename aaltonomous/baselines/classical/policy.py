@@ -73,6 +73,14 @@ command) as the command in force and starts from the intended pose that command 
 frozen while a plan is planned or executed; the estimate it learns (still samples: the detector's probe via
 feed_probe(), the settle + look holds at home, the settle before every grasp) is blended in at the start of the next
 home settle (sag.blend_vel; that settle is longer by the blend). Logged once per episode and on material changes.
+
+Planning time (policy.plan_budget_s, robot profile 2 s; off in the sim): each look's planning stops at the budget
+(Planner.deadline); the policy looks again at once and the interrupted search resumes, in the same object order (a
+still object keeps its pose: _snap; the planner's memos), so it ends with the plan an uninterrupted search finds;
+with policy.budget_max set, after that many interruptions an object is skipped until it moves (logged). Boxes no arm
+can deliver into are dropped before planning, one line per box: grasp.far on, the far module decides
+(box_reachable); off, the reach test (_deliverable). Every look logs (server log, not an event) `plan: X s wall
+(slots, neighbours, carry, dry-run, ik, far; perception; still; plans; budget hits)`; look_s keeps the wall times.
 """
 from __future__ import annotations
 
@@ -94,13 +102,14 @@ from .insert import select_mode as select_insert_mode
 from .instruction import mapping_colors, object_bin, parse_instruction
 from .kinematics import ArmKinematics
 from .perception import Perception, world_classes
-from .planner import PAIR_CHECK_STEP, Planner, checked_masks, correct_ticks, held_masks
+from .planner import PAIR_CHECK_STEP, PROF_KEYS, PlanBudget, Planner, checked_masks, correct_ticks, held_masks
 from .sag import SagFF
 from .still import StillGate
 from .verify import EMPTY, HELD, GraspMonitor, grasp_window
 
 HZ = 30.0
 MAX_ABORT_TRIES = 3  # per grasp: an abort rejected by a check (e.g. still lifting, too low) is tried again later
+MAX_LOOK_ERRORS = 3  # per episode: a look / plan that raised is retried (settle + look) until this many, then done
 
 
 def _mapping_text(m):
@@ -186,6 +195,7 @@ class ClassicalPolicy:
         if isinstance(info, str):
             info = {"instruction": info}
         info = info or {}
+        self.planner.fail_memo, self.planner._ik_memo = {}, {}   # (per episode: failed candidates, IK memo)
         self.insert = select_insert_mode(info, self.cfg)   # rung 3 (insert.py): no bins; None = rungs 1-2
         self.mapping, self.mapping_source, self.instruction_parse, note = (
             self._mapping(info) if self.insert is None else ({}, f"insert:{self.insert.source}", None,
@@ -226,6 +236,7 @@ class ClassicalPolicy:
         self.last_detections = []
         self._box_looks = 0                           # extra looks for boxes not found (perception.boxes.relook)
         self.look_s = []                              # wall s of each look (perception + planning)
+        self._still_s = 0.0                           # still gate wait before the next look (episode s; plan: line)
         if hasattr(self.perception, "reset_boxes"):   # boxes are found anew every episode (they may have been moved)
             self.perception.reset_boxes()
             self._use_boxes()
@@ -312,8 +323,10 @@ class ClassicalPolicy:
         """Target bin of detection d: instruction.object_bin (scene.resolve_bin over every colour / shape the object
         may have: shape None or colour "unknown" count as any). None = no bin for now (its key was not understood, or
         the mapping needs the shape / colour and it is not recognised): it stays on the counter and is looked at
-        again in later looks (neighbours gone, it may be recognised then). Never a guess."""
-        return object_bin(self.mapping, d.color, getattr(d, "shape", None), self.colors.names)
+        again in later looks (neighbours gone, it may be recognised then). Never a guess. Shape None: the shape
+        earlier looks accepted for this object, if any (policy.shape_memory, _shape_memory)."""
+        return object_bin(self.mapping, d.color, getattr(d, "shape", None) or getattr(d, "shape_mem", None),
+                          self.colors.names)
 
     def confirm(self):
         self._decision = "go"
@@ -394,6 +407,7 @@ class ClassicalPolicy:
                 if r is None:
                     return self._hold()
                 self._gate_ok = True
+                self._still_s = float(r.get("waited_s") or 0.0)
                 self._note(t, StillGate.text(r))
             if self.ff is not None and self._job is None and self._ff_resettle(t):
                 self.state = "settle"      # the estimate moved materially: blend it in before planning with it
@@ -444,14 +458,89 @@ class ClassicalPolicy:
             job["result"] = ("error", repr(e))
 
     def _look(self, obs):
-        w0 = time.perf_counter()
+        """One look (_look_plan) timed, with policy.plan_budget_s: the planner's searches stop at the deadline
+        (perception + budget after the look started; Planner.check_budget), then one `plan:` line in the log (not an
+        event: events stay deterministic) and its wall time in look_s."""
+        t0 = time.perf_counter()
+        P, b = self.planner, self._plan_budget()
+        P.prof_reset(keep_memo=bool(b))   # (with a budget the IK memo lives for the episode: an interrupted search
+                                          # resumes, see _snap)
+        self._look_t = {"t0": t0, "plans": len(self.plans), "budget": []}
+        P.deadline = None if not b else t0 + float(b)
         try:
             return self._look_plan(obs)
-        finally:   # wall time of the look + planning (perception, every plan tried), one log line per look (not an
-            self.look_s.append(time.perf_counter() - w0)   # event: events stay deterministic)
-            if self.log is not None:
-                self.log(f"[classical t={float(obs.get('t', 0.0)):6.2f}] plan time {self.look_s[-1]:.2f} s "
-                         f"(look + planning)")
+        except PlanBudget:   # (outside plan(): the boxes' reach tests; done ones are cached, look again)
+            self._look_t["budget"].append("reach tests")
+            return ("budget", None, 0)
+        finally:
+            P.deadline = None
+            w, pr = time.perf_counter() - t0, P.prof
+            self.look_s.append(w)
+            bud, still, self._still_s = self._look_t["budget"], self._still_s, 0.0
+            self.log(f"[classical t={float(obs.get('t', 0.0)):6.2f}] plan: {w:.2f} s wall (" + ", ".join(
+                f"{k} {pr.get(k, 0.0):.2f}" for k in PROF_KEYS) + f"; perception {self._look_t.get('perc', 0.0):.2f}; "
+                f"still {still:.2f} s; {len(self.plans) - self._look_t['plans']} plans" + (
+                    f"; budget {float(b):.1f} s hit: {', '.join(bud)}" if bud else "") + ")")
+
+    def _plan_budget(self):
+        """policy.plan_budget_s (s; null = no budget); policy.look_budget_s is an alias for it (older configs)."""
+        pc = self.cfg["policy"]
+        b = pc.get("plan_budget_s")
+        return pc.get("look_budget_s") if b is None else b
+
+    def _snap(self, dets, recs, tol=0.002):
+        """policy.plan_budget_s on: an object seen within `tol` (m, every axis; yaw 1 deg) of where it was planned
+        from before keeps that pose (perception noise is ~1 mm), so its plan and its neighbours' are the same IK
+        problems as in the last look: the planner's IK memo resumes a search the budget stopped."""
+        if not self._plan_budget():
+            return
+        for d, r in zip(dets, recs):
+            old = r.get("plan_pose")
+            same = (old is not None and np.abs(d.top - old[0]).max() <= tol and old[2] == getattr(d, "shape", None)
+                    and (old[1] is None) == (d.yaw is None)
+                    and (d.yaw is None or abs((d.yaw - old[1] + np.pi) % (2 * np.pi) - np.pi) <= np.radians(1.0)))
+            if same:
+                d.top, d.yaw = old[0].copy(), old[1]
+            else:
+                r["plan_pose"] = (d.top.copy(), d.yaw, getattr(d, "shape", None))
+
+    def _budget_skip(self, rec, d, t, rest=()):
+        """A plan interrupted by policy.plan_budget_s: the object waits for the next look (it and the candidates not
+        planned yet are remembered: not failed); after policy.budget_max interruptions (null: never) it is skipped until
+        it moves."""
+        rec["budget"] = rec.get("budget", 0) + 1
+        n, cap = rec["budget"], self.cfg["policy"].get("budget_max")
+        left = "".join(f", obj{r['id']}" for _, r in rest)
+        self._look_t["budget"].append(f"obj{rec['id']}")
+        if cap is not None and n >= int(cap):
+            rec["failed_at"] = d.top[:2].copy()
+            self._note(t, f"obj{rec['id']} {d.color}: plan budget exceeded {n} times: skipped until it moves"
+                          + (f" (not planned this look{left})" if left else ""))
+        else:
+            self._note(t, f"obj{rec['id']} {d.color}: plan budget exceeded: planned again next look"
+                          + (f" (not planned this look{left})" if left else ""))
+
+    def _deliverable(self, cands, t):
+        """grasp.reach_check: the objects for a box that neither arm reaches (Planner._reaches_bin, cached per box
+        pose) are left at once, one log line per box (planned, both arms and a relocation search would fail)."""
+        P = self.planner
+        if not self.cfg["grasp"].get("reach_check"):
+            return cands
+        out, ok, left = [], {}, {}
+        for d, r in cands:
+            b = self.bin_for(d)
+            if b not in ok:
+                own = ("left", "right") if b not in P.boxes or P.bin_xy(b)[1] >= 0 else ("right", "left")
+                ok[b] = b not in P.boxes or any(P._reaches_bin(s, b) for s in own)   # (own side first: one test)
+                # (PlanBudget from a reach test: _look looks again; the tests done so far are cached per box pose)
+            if ok[b]:
+                out.append((d, r))
+            else:
+                left.setdefault(b, []).append(f"obj{r['id']}")
+        for b, v in left.items():
+            self._note(t, f"{b} box: neither arm reaches it (reach test at carry height above its drop point): "
+                          f"{', '.join(v)} left on the counter")
+        return out
 
     def _look_plan(self, obs):
         t = float(obs.get("t", 0.0))
@@ -461,12 +550,18 @@ class ClassicalPolicy:
                 self._note(t, n)
         self._self_mask(obs)
         dets = self.perception.detect(obs["head_rgb"], obs["head_depth"])
+        self._look_t["perc"] = time.perf_counter() - self._look_t["t0"]
+        if self.planner.deadline is not None:   # (planning keeps at least half the budget after a slow frame)
+            b = float(self._plan_budget())
+            self.planner.deadline = max(self.planner.deadline, time.perf_counter() + 0.5 * b)
         self._use_boxes()
         self._calibrate(dets, t)
         self.last_detections = dets
         shorts = self._far_check(dets, t)
         recs = self._track(dets)
         self._far_short(shorts, recs)
+        self._shape_memory(dets, recs)
+        self._snap(dets, recs)
         bins = [self.bin_for(d) for d in dets]
         self._note(t, f"look: {len(dets)} detections" + "".join(  # colour:shape/hue(x,y)=object id/tries->bin
             f" {d.color}{self._shape_note(d)}{self._hue_note(d)}({d.top[0]:+.3f},{d.top[1]:+.3f})"
@@ -476,12 +571,16 @@ class ClassicalPolicy:
         # now, not failed
         # a box no arm can deliver into (grasp.far on: no drop slot, no far release in reach; cached per box pose):
         # its objects are left now, before any per-object planning, one line per box
+        t_far = time.perf_counter()
         far = {b: self.planner.box_reachable(b) for b in set(bins) if b is not None and self.planner.box_ok(b)}
+        self.planner.prof["far"] = self.planner.prof.get("far", 0.0) + time.perf_counter() - t_far
         for b, (ok, why) in sorted(far.items()):
             if not ok:
                 self._note(t, f"{b} box out of reach ({why}): its {bins.count(b)} object(s) stay")
         cands = [(d, r) for d, r, b in zip(dets, recs, bins) if b is not None and self.planner.box_ok(b)
                  and far[b][0] and self._eligible(r, d.top[:2])]
+        if not self.planner.far.on():   # (grasp.far on: box_reachable above decides, one line per box)
+            cands = self._deliverable(cands, t)
         if self.cfg["policy"]["order"] == "nearest_bin":
             def key(d):
                 return np.linalg.norm(d.top[:2] - self.planner.bin_xy(self.bin_for(d)))
@@ -489,19 +588,15 @@ class ClassicalPolicy:
             def key(d):
                 return -d.n_px
         # untried first; grasp.far: objects for a box only a MARGINAL far release reaches after the others (a miss there
-        # costs no points but time)
+        # costs no points but time). (An object whose search policy.plan_budget_s interrupted keeps its place: it
+        # resumes first next look, so the order of the plans, which far releases into a filling box depend on, is the
+        # one without a budget.)
         grade = {b: self.planner.box_grade(b) for b in far}
         cands.sort(key=lambda dr: (dr[1]["tries"] > 0, grade.get(self.bin_for(dr[0])) == "marginal",
                                    self._crowded(dr[0], dets), key(dr[0])))
         self._set_drops()
         blocked = []
-        budget = self.cfg["policy"].get("look_budget_s")   # wall s of planning per look (null: none)
-        t0 = time.perf_counter()
         for i, (d, rec) in enumerate(cands):
-            if budget is not None and i and time.perf_counter() - t0 > float(budget):
-                self._note(t, f"look budget: {i} of {len(cands)} objects planned in {time.perf_counter() - t0:.1f} s, "
-                              f"none executable: looking again")
-                return ("budget", None, len(dets))
             others = [o for o in dets if o is not d]
             if self._same_scene(rec.get("blocked"), others):   # blocked in this very scene: planning again is moot
                 blocked.append((d, rec, others))
@@ -523,6 +618,9 @@ class ClassicalPolicy:
             finally:
                 self.planner.far_alt = 0
             self.plans.append(p)
+            if p.budget:    # policy.plan_budget_s: look again; the rest is remembered (not failed)
+                self._budget_skip(rec, d, t, cands[i + 1:])
+                return ("budget", None, len(dets))
             if p.ok:
                 rec["blocked"] = None
                 m = self._accept(p, d, rec, cands, t)
@@ -537,6 +635,8 @@ class ClassicalPolicy:
                 lb = self._least_bad([(d, rec, others)], cands, t)
                 if lb is not None:
                     return ("plan", lb, len(dets))
+                if self._look_t["budget"]:   # (policy.plan_budget_s stopped it: look again)
+                    return ("budget", None, len(dets))
             if p.blocked:   # a neighbour is in the way of every candidate: take another object first
                 rec["blocked"] = np.array([o.top[:2] for o in others]).reshape(-1, 2)
                 self._note(t, f"obj{rec['id']} {d.color}: blocked ({p.reason}); other objects first")
@@ -544,10 +644,9 @@ class ClassicalPolicy:
                 continue
             rec["failed_at"] = d.top[:2].copy()
             self.log(f"[classical] skip {d}: {p.reason}")
-        if budget is not None and blocked and time.perf_counter() - t0 > float(budget):
-            self._note(t, f"look budget: {time.perf_counter() - t0:.1f} s, least-bad pass left for the next look")
-            return ("budget", None, len(dets))
         m = self._least_bad(blocked, cands, t)
+        if m is None and self._look_t.get("budget"):   # (stopped by policy.plan_budget_s: look again)
+            return ("budget", None, len(dets))
         return ("none", None, len(dets)) if m is None else ("plan", m, len(dets))
 
     def _far_check(self, dets, t):
@@ -582,13 +681,36 @@ class ClassicalPolicy:
                 r["tries"] = max(r["tries"], old["tries"])
             r["far_short"] = max(r.get("far_short", 0), n)
 
+    def _shape_memory(self, dets, recs):
+        """policy.shape_memory: an object's shape does not change when a missed grasp knocks it over or a hand
+        hides its outline. Every shape perception accepted for a tracked object is a vote in its record; a detection
+        without one (shape None) gets `shape_mem` = the votes' shape when they all agree, for its BIN only
+        (bin_for): its grasp stays shape-agnostic (shape / yaw / lying untouched). Not when another detection of
+        the same colour is within 2 x policy.same_object_radius (the track could have swapped them) or the votes
+        disagree."""
+        if not self.cfg["policy"].get("shape_memory", False):
+            return
+        r = 2.0 * float(self.cfg["policy"]["same_object_radius"])
+        for d, rec in zip(dets, recs):
+            votes = rec.setdefault("shapes", {})
+            d.shape_mem = None
+            if getattr(d, "shape", None) is not None:
+                votes[d.shape] = votes.get(d.shape, 0) + 1
+            elif len(votes) == 1 and not any(o is not d and o.color == d.color
+                                             and np.linalg.norm(o.top[:2] - d.top[:2]) < r for o in dets):
+                d.shape_mem = next(iter(votes))
+
     @staticmethod
     def _shape_note(d):
-        """':tri.85' = shape and its confidence (what decides a face-aligned grasp); ':?' = no shape accepted;
-        'tri.85L+12' = lying on a side, ridge / axis at +12 deg."""
+        """':tri.85' = shape and its confidence (what decides a face-aligned grasp); ':?' = no shape accepted
+        (':?=tri': none now, the bin from earlier looks' shape, _shape_memory); 'tri.85L+12' = lying on a side,
+        ridge / axis at +12 deg."""
         sh = getattr(d, "shape", None)
         ly = f"L{np.degrees(d.ridge_yaw):+.0f}" if getattr(d, "lying", False) and d.ridge_yaw is not None else ""
-        return ":?" if sh is None else f":{sh[:3]}{('%.2f' % float(getattr(d, 'shape_conf', 0.0)))[1:]}{ly}"
+        if sh is None:
+            mem = getattr(d, "shape_mem", None)
+            return ":?" if mem is None else f":?={mem[:3]}"
+        return f":{sh[:3]}{('%.2f' % float(getattr(d, 'shape_conf', 0.0)))[1:]}{ly}"
 
     @staticmethod
     def _hue_note(d):
@@ -659,7 +781,11 @@ class ClassicalPolicy:
             return None
         p.rec = rec
         rest = [(d2, r2, self.bin_for(d2)) for d2, r2 in cands if r2 is not rec]
-        m = self._pair(p, rest, self.arm_cmd, self.hand_cmd, t)
+        try:
+            m = self._pair(p, rest, self.arm_cmd, self.hand_cmd, t)
+        except PlanBudget:   # (policy.plan_budget_s during the pair search: p alone)
+            self._note(t, "pair: not planned, plan budget exceeded")
+            m = p
         if m is p:
             m = self._guard(p, self.arm_cmd, self.hand_cmd, t)
             if m is None:   # too close to the parked arm, no evade: as a failed plan (until it moves)
@@ -685,6 +811,9 @@ class ClassicalPolicy:
                                   obstacles=[o.top[:2] for o in others], variant=self._variant(rec), neighbours=others,
                                   least_bad=True)
             self.plans.append(p)
+            if p.budget:    # (policy.plan_budget_s: _look_plan looks again)
+                self._budget_skip(rec, d, t)
+                return None
             if not p.ok:
                 rec["lb_failed"] = np.array([o.top[:2] for o in others]).reshape(-1, 2)
                 self._note(t, f"obj{rec['id']} {d.color}: no least-bad plan either ({p.reason})")
@@ -725,13 +854,15 @@ class ClassicalPolicy:
 
     def _after_look(self, res, t):
         kind = res[0]
-        if kind == "budget":   # policy.look_budget_s ran out without a plan: look (and plan the rest) again
+        if kind == "error":   # (one bad frame / corner case must not end the episode: settle + look again, twice)
+            n = sum(m.startswith("look/plan error") for _, m in self.events) + 1
+            self._note(t, f"look/plan error {res[1]}: " + ("stopping" if n >= MAX_LOOK_ERRORS else
+                                                            f"looking again ({n}/{MAX_LOOK_ERRORS})"))
+            self.state = "done" if n >= MAX_LOOK_ERRORS else "settle"
+            return self._hold(done=self.state == "done")
+        if kind == "budget":   # policy.plan_budget_s stopped the search: look again at once (nothing failed)
             self.state = "look"
             return self._hold()
-        if kind == "error":
-            self._note(t, f"look/plan error {res[1]}: stopping")
-            self.state = "done"
-            return self._hold(done=True)
         if kind == "none":
             nb = sum(self.bin_for(d) is None for d in self.last_detections)
             nx = sum(self.bin_for(d) is not None and not self.planner.box_ok(self.bin_for(d))
@@ -862,6 +993,9 @@ class ClassicalPolicy:
             m, p2, why = self.planner.plan_pair(first, d, b, arm, hand, variant=self._variant(rec), drop_offset=off,
                                                 drop_avoid=avoid, neighbours=others)
             self.plans.append(p2)
+            if p2.budget:   # policy.plan_budget_s: no more pairing this look, `first` alone
+                self._note(t, f"pair: {self._who(rec, d)} ({side} arm) not planned: plan budget exceeded")
+                break
             if m is not None and t + m.duration > self.time_limit:
                 m, why = None, f"pair {m.duration:.1f} s > {self.time_limit - t:.1f} s left"
             if m is None:

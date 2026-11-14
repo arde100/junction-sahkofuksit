@@ -127,15 +127,35 @@ class TestTouching(unittest.TestCase):
 class TestGrasp(unittest.TestCase):
     """A lying prism is pinched on its two flat ends: fingers along the ridge, low on it; base and sim profiles."""
 
-    def _det(self, ridge):
-        d = Detection("red", np.array([0.30, 0.12, SC.counter_z + H]), 500, 500, "depth", shape="triangle",
+    def _det(self, ridge, x=0.30, y=0.12):
+        d = Detection("red", np.array([x, y, SC.counter_z + H]), 500, 500, "depth", shape="triangle",
                       shape_conf=0.9)
         d.lying, d.ridge_yaw = True, ridge
         return d
 
+    def _check_plan(self, pl, cfg, p, ridge, side=None):
+        """A plan of an end grasp: ok, 0 clips, the arm expected, fingers within lying_tol_deg of the ridge (and within
+        tol_deg of the direction asked for), low on the prism."""
+        fa = cfg["grasp"]["face_align"]
+        self.assertTrue(p.ok, p.reason)
+        self.assertEqual(p.safety_clips, 0)
+        if side:
+            self.assertEqual(p.side, side)
+        e = pl._finger_err(p, p.side, np.array([np.cos(ridge), np.sin(ridge), 0.0]))
+        self.assertLessEqual(min(e, 180 - e), fa["lying_tol_deg"] + 0.5)
+        asked = np.radians(p.face)
+        self.assertLessEqual(ridge_err(asked, ridge), max(abs(o) for o in fa["lying_offsets_deg"]) + 1e-6)
+        e2 = pl._finger_err(p, p.side, np.array([np.cos(asked), np.sin(asked), 0.0]))
+        self.assertLessEqual(e2, fa["tol_deg"] + 0.5)
+        self.assertLess(p.waypoints["grasp"][2] - SC.counter_z, 0.5 * H)   # lower than an upright grasp
+
     def test_finger_directions_and_height(self):
+        """Candidates: only the end grasp (no stock hints: they pinch the slopes), the two ridge directions first,
+        then turned by lying_offsets_deg, each tolerance keeping the fingers within lying_tol_deg of the ridge, at
+        lying_height_frac; both profiles."""
         for prof in ("none", "sim"):
             cfg = load_config(profile=prof)
+            fa = cfg["grasp"]["face_align"]
             pl = Planner(cfg, SC, hand_postures(cfg), home_arm(cfg))
             for ridge in (0.0, 0.5, -1.2, 1.5):
                 d = self._det(ridge)
@@ -143,14 +163,43 @@ class TestGrasp(unittest.TestCase):
                 self.assertTrue(dirs)
                 self.assertTrue(all(ridge_err(a, ridge) < 1e-6 for a in dirs))
                 C = pl._candidates(d, "left")
-                self.assertEqual([c["kind"] for c in C], ["face"] * len(dirs))   # no stock hints (the slopes)
-                self.assertEqual(C[0]["det"].grasp_height_frac, cfg["grasp"]["face_align"]["lying_height_frac"])
-            p = pl.plan(self._det(0.1), pl.home, pl.post["open"], bin_name="left")
-            self.assertTrue(p.ok, (prof, p.reason))
-            self.assertEqual(p.safety_clips, 0)
-            e = pl._finger_err(p, p.side, np.array([np.cos(0.1), np.sin(0.1), 0.0]))
-            self.assertLess(min(e, 180 - e), 13)
-            self.assertLess(p.waypoints["grasp"][2] - SC.counter_z, 0.5 * H)   # lower than an upright grasp
+                self.assertEqual([c["kind"] for c in C], ["face"] * len(C))       # no stock hints (the slopes)
+                self.assertTrue(all(ridge_err(np.radians(c["deg"]), ridge) < 1e-6 for c in C[:len(dirs)]))
+                self.assertTrue(all(ridge_err(np.radians(c["deg"]), ridge) + c["tol"] <= fa["lying_tol_deg"] + 1e-6
+                                    for c in C))
+                self.assertTrue(all(c["det"].grasp_height_frac == fa["lying_height_frac"] for c in C))
+
+    def test_sim_end_grasp(self):
+        cfg = load_config(profile="sim")
+        pl = Planner(cfg, SC, hand_postures(cfg), home_arm(cfg))
+        self._check_plan(pl, cfg, pl.plan(self._det(0.1), pl.home, pl.post["open"], bin_name="left"), 0.1)
+
+    def test_robot_within_the_joint_range(self):
+        """Robot profile (ik.joint_range): the end grasp exists only for some ridge directions per arm (plan table:
+        x 0.29, y 0 - ridge 45 deg: right arm, centre / right box; ridge 135 deg: left arm, left / centre box; with
+        and without face_align.lying_offsets_deg; there the grasp stays below half height, at ridge 30 / 150 deg the
+        fingertip clearance raises it to 0.52 H); the arm that can hold the ends is chosen; a ridge no arm can take
+        (0 deg there) is left at once, with its reason."""
+        import time
+        on = {"grasp.face_align.lying_tol_deg": 22, "grasp.face_align.lying_offsets_deg": [0, -10, 10],
+              "grasp.face_align.lying_carry_weight": 0.3}
+        for ov in (on, {}):
+            cfg = load_config(profile="none", overrides=ov)
+            self.assertTrue(cfg["ik"].get("joint_range"))
+            pl = Planner(cfg, SC, hand_postures(cfg), home_arm(cfg))
+            for ridge, box, side in ((np.radians(135), "left", "left"), (np.radians(135), "center", "left"),
+                                     (np.radians(45) - np.pi, "right", "right"), (np.radians(45), "center", "right")):
+                with self.subTest(offsets=bool(ov), ridge=np.degrees(ridge), box=box):
+                    p = pl.plan(self._det(ridge, 0.29, 0.0), pl.home, pl.post["open"], bin_name=box)
+                    self._check_plan(pl, cfg, p, ridge, side)
+        t0 = time.perf_counter()
+        p = pl.plan(self._det(0.0, 0.29, 0.0), pl.home, pl.post["open"], bin_name="center")
+        self.assertFalse(p.ok)
+        self.assertEqual(p.reason, "lying prism at ridge 0 deg: no end grasp within the joint range")
+        self.assertLess(time.perf_counter() - t0, 3.0)     # a few IK solves, not a full plan search
+        t0 = time.perf_counter()                           # cached for the next look
+        self.assertFalse(pl.plan(self._det(0.0, 0.29, 0.0), pl.home, pl.post["open"], bin_name="left").ok)
+        self.assertLess(time.perf_counter() - t0, 0.1)
 
 
 class TestOrder(unittest.TestCase):

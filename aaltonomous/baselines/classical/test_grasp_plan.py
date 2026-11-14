@@ -595,6 +595,29 @@ class TestSimProfilePlans(unittest.TestCase):
         self.assertGreaterEqual(aligned, 12)
         self.assertGreaterEqual(cubes, 8, "cube plans that are face-aligned (of 16)")
 
+    def test_standing_prism_grasped_higher(self):
+        """grasp.face_align.triangle_height_frac (sim): a standing prism's grasp point sits at that fraction of the
+        object height (face-aligned or stock hint), a cube's at grasp.height_frac as before; a lying prism keeps
+        lying_height_frac. Base profile: null (unchanged)."""
+        g, fa = self.pl.cfg["grasp"], self.pl.cfg["grasp"]["face_align"]
+        thf = fa["triangle_height_frac"]
+        self.assertIsNotNone(thf)
+        self.assertGreater(thf, g["height_frac"])
+        H, zc = self.pl.height, SC.counter_z
+        for shape, want in (("triangle", thf), ("cube", g["height_frac"])):
+            for yd, y in ((-40, 0.15), (0, -0.07), (40, -0.15)):
+                with self.subTest(shape=shape, yaw=yd, y=y):
+                    p = self.pl.plan(det("red", 0.30, y, shape, np.radians(yd)), self.home, self.post["open"],
+                                     relocate=False)
+                    self.assertTrue(p.ok, p.reason)
+                    self.assertGreaterEqual(p.waypoints["grasp"][2], zc + want * H - 1e-6)   # (raised only to
+                    self.assertLess(p.waypoints["grasp"][2], zc + want * H + 0.004)          # clear the counter)
+        d = det("red", 0.30, 0.12, "triangle", 0.0)
+        d.lying, d.ridge_yaw = True, 0.3
+        c = self.pl._candidates(d, "left")
+        self.assertTrue(c and all(x["det"].grasp_height_frac == fa["lying_height_frac"] for x in c))
+        self.assertIsNone(planner("none")[0].cfg["grasp"]["face_align"]["triangle_height_frac"])
+
     def test_slots_reachable(self):
         """Drop slots with this grasp: 4 per (bin, arm) (of count 5: the outer second-row slot, y +-0.291 in the side
         bins / the far-side one in the centre bin, is out of reach; sim_legacy / base: 5), inside the bin, reachable."""
@@ -608,6 +631,60 @@ class TestSimProfilePlans(unittest.TestCase):
             w = s["wall_clear"] - 1e-9
             self.assertTrue(np.all(m >= lo[:2] + w) and np.all(m <= hi[:2] - w), S)
             self.assertTrue(all(self.pl._slot_reach(side, p) for p in S))
+
+
+class TestTriangleWait(unittest.TestCase):
+    """profiles.sim grasp.face_align.triangle_wait. Seed 1009 of the train evaluations (m25o / m27o, 2026-11-14): the
+    red triangle's face-aligned left-arm grasp came 17 mm (model) into the blue cube 9 cm to its left, the stock
+    forward hint did not, and that unaligned pinch missed 4 times in a row (the triangle stayed on the counter)."""
+
+    TRI, CUBE = (0.321, 0.078), (0.304, 0.169)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pl, cls.post, cls.home = planner("sim")
+
+    def _plan(self, pl, shape="triangle", nb=True, **kw):
+        d = det("red", *self.TRI, shape, 0.0)
+        return pl.plan(d, self.home, self.post["open"], bin_name="left", relocate=False,
+                       neighbours=[det("blue", *self.CUBE, "cube", 0.0)] if nb else [], **kw)
+
+    def test_blocked_aligned_triangle_waits(self):
+        self.assertTrue(self.pl.cfg["grasp"]["face_align"]["triangle_wait"])
+        p = self._plan(self.pl)
+        self.assertFalse(p.ok)
+        self.assertTrue(p.blocked)
+        self.assertIn("aligned triangle grasp blocked", p.reason)
+        q = self._plan(self.pl, nb=False)                     # the neighbour gone: the aligned grasp
+        self.assertTrue(q.ok)
+        self.assertIsNotNone(q.face)
+        r = self._plan(self.pl, least_bad=True)               # least-bad pass: planned as before
+        self.assertTrue(r.ok)
+
+    def test_off_and_other_shapes_unchanged(self):
+        off = planner("sim", **{"grasp.face_align.triangle_wait": False})[0]
+        p = self._plan(off)                                   # the old fallback: stock hint, unaligned
+        self.assertTrue(p.ok)
+        self.assertIsNone(p.face)
+        self.assertIsNotNone(p.hint)
+        for shape in ("cube", "cylinder"):
+            a, b = self._plan(self.pl, shape), self._plan(off, shape)
+            self.assertEqual((a.ok, a.hint, a.face), (b.ok, b.hint, b.face), shape)
+        self.assertFalse(planner("sim_legacy")[0].cfg["grasp"]["face_align"]["triangle_wait"])
+        self.assertFalse(planner("none")[0].cfg["grasp"]["face_align"]["triangle_wait"])
+
+    def test_policy_takes_the_neighbour_first(self):
+        tri, cube = det("red", *self.TRI, "triangle", 0.0), det("blue", *self.CUBE, "cube", 0.0)
+        cfg = load_config(profile="sim", overrides={"two_arm.enabled": False, "two_arm.avoid_parked": False})
+        pol = ClassicalPolicy(cfg, log=None)
+        pol.arm_cmd, pol.hand_cmd = pol.home.copy(), pol.post["open"].copy()
+        pol.perception.detect = lambda rgb, depth: [tri, cube]
+        kind, plan, _ = pol._look({"head_rgb": None, "head_depth": None, "t": 0.0})
+        self.assertEqual(kind, "plan")
+        self.assertEqual(plan.color, "blue")
+        rt = next(o for o in pol.objs if o["color"] == "red")
+        self.assertIsNotNone(rt["blocked"])
+        self.assertIsNone(rt["failed_at"])
 
 
 class _FakeSceneClient:

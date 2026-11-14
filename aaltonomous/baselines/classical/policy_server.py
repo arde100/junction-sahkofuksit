@@ -21,10 +21,12 @@ from __future__ import annotations
 import logging
 import os
 import time
+import traceback
 
 import numpy as np
 
 from aaltonomous.deploy.policy_server import Policy, serve
+from aaltonomous.interface.safety import JointSpec
 
 from .config import AUTO, load_config
 from .policy import ClassicalPolicy
@@ -107,6 +109,87 @@ class ClassicalServerPolicy(Policy):
                 "hand_q_target": np.asarray(a["hand_q_target"], np.float64), "done": bool(a.get("done", False))}
 
 
+class GuardedPolicy(Policy):
+    """The image's outermost layer: no exception and no invalid action reaches the runner. An error reply makes the
+    runner hold WITHOUT refreshing its watchdog (1 s of them = safe stop, the episode ends: a failed sim gate), and a
+    reset() error ends the whole run (runner: policy_connection_lost).
+      act(): an exception or an invalid action (shape, NaN / inf) -> hold the last target returned this episode (a
+        constant target: no clip); after DONE_AFTER such calls in a row -> that hold with done (the points stay).
+        Nothing returned yet this episode -> the measured pose (where the runner's filter starts), if finite; else the
+        exception goes on (the runner holds its own command).
+      reset(): an exception -> this episode sorts nothing (the half-reset policy may still hold the last episode's
+        mapping): hold the start pose, done."""
+    DONE_AFTER = 30
+    HOLD_TICKS = 3
+
+    def __init__(self, inner, log=log.error):
+        self.inner, self.log = inner, log
+        self.name = getattr(inner, "name", "policy")
+        self.action_horizon = getattr(inner, "action_horizon", None)
+        self.last, self.fails, self.broken = None, 0, False
+
+    def __getattr__(self, k):   # wait_ready, pols, ... of the wrapped policy
+        if k == "inner":
+            raise AttributeError(k)
+        return getattr(self.inner, k)
+
+    def reset(self, instruction, task=None, seed=None):
+        self.last, self.fails, self.broken = None, 0, False
+        try:
+            self.inner.reset(instruction, task=task, seed=seed)
+        except Exception:
+            self.broken = True
+            self.log("reset failed (this episode holds still and ends): %s" % traceback.format_exc())
+
+    @staticmethod
+    def _valid(a):
+        try:
+            A, H = np.asarray(a["arm_q_target"], np.float64), np.asarray(a["hand_q_target"], np.float64)
+        except Exception:
+            return None
+        if A.ndim not in (1, 2) or H.ndim not in (1, 2) or A.shape[-1] != 14 or H.shape[-1] != 14:
+            return None
+        A, H = np.atleast_2d(A), np.atleast_2d(H)
+        if not len(A) or not len(H) or (len(A) != len(H) and 1 not in (len(A), len(H))):
+            return None
+        if not (np.isfinite(A).all() and np.isfinite(H).all()):
+            return None
+        return A[-1].copy(), H[-1].copy()
+
+    def _hold(self, obs, done):
+        if self.last is None:
+            sp = JointSpec()
+            a, h = np.asarray(obs["arm_q"], np.float64), np.asarray(obs["hand_q"], np.float64)
+            if a.shape != (14,) or h.shape != (14,) or not (np.isfinite(a).all() and np.isfinite(h).all()):
+                return None
+            self.last = (np.clip(a, sp.arm_lower, sp.arm_upper), np.clip(h, sp.hand_lower, sp.hand_upper))
+        k = 1 if done else self.HOLD_TICKS
+        return {"arm_q_target": np.repeat(self.last[0][None], k, 0),
+                "hand_q_target": np.repeat(self.last[1][None], k, 0), "done": bool(done)}
+
+    def act(self, obs):
+        if self.broken:
+            out = self._hold(obs, True)
+            if out is None:
+                raise RuntimeError("reset failed and no valid measured pose to hold")
+            return out
+        try:
+            a = self.inner.act(obs)
+            v = self._valid(a)
+            if v is None:
+                raise ValueError(f"invalid action from the policy: {a!r}"[:300])
+        except Exception:
+            self.fails += 1
+            if self.fails <= 3 or self.fails % 30 == 0:
+                self.log("act failed (%d in a row; holding the last target): %s" % (self.fails, traceback.format_exc()))
+            out = self._hold(obs, self.fails >= self.DONE_AFTER)
+            if out is None:
+                raise
+            return out
+        self.fails, self.last = 0, v
+        return a
+
+
 def make_policy():
     """AALTO_PROFILE=auto: AutoProfilePolicy (one ClassicalServerPolicy per world, detection per episode); else
     ClassicalServerPolicy on the configured profile (forced: no detection)."""
@@ -123,4 +206,4 @@ if __name__ == "__main__":
     if hasattr(pol, "wait_ready"):  # built in the background; serve once both exist (the runner waits for the port)
         pol.wait_ready(300.0)
     log.info("classical baseline loaded in %.1f s", time.monotonic() - t0)
-    serve(pol, port=int(os.environ.get("PORT", 8000)))
+    serve(GuardedPolicy(pol), port=int(os.environ.get("PORT", 8000)))

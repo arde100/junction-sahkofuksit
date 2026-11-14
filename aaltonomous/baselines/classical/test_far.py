@@ -283,13 +283,15 @@ class TestFarEpisodes(unittest.TestCase):
         self.assertLess(max(pol.look_s[1:] or [0.0]), 1.0, pol.look_s)
 
     def test_look_budget(self):
-        """policy.look_budget_s exhausted after one object: the look ends ('look budget'), the next look plans the
-        rest; everything still ends in its box."""
+        """policy.plan_budget_s (the per-look planning budget; look_budget_s is its alias) far below what a far
+        plan needs: looks stop at it ('plan budget exceeded'), the next look resumes the search; everything still
+        ends in its box."""
         rows = box_row(0.47, 0, WALL, GAP, size=SIZE, wall_t=0.004)
-        pol, env, info = run_episode(2, rows, n_max=3, overrides={"policy.look_budget_s": 1e-6})
+        pol, env, info = run_episode(2, rows, n_max=3, overrides={"policy.plan_budget_s": 0.2})
         self.assertEqual(info["safety_summary"]["clipped_steps"], 0)
         out = env.backend.outcomes(pol.mapping)
         self.assertEqual(out, ["correct"] * len(out), [m for _, m in pol.events])
+        self.assertTrue(any("plan budget exceeded" in m for _, m in pol.events), [m for _, m in pol.events])
 
 
 if __name__ == "__main__":

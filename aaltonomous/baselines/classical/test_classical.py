@@ -476,10 +476,13 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((old["grasp"]["extra_hints"], old["right_hand_slots"]), ([], None))
         self.assertFalse(old["grasp"]["correct"]["enabled"])           # (sim: on; test_correct.py)
         self.assertFalse(old["sag"]["enabled"])                        # (sim: on; test_sag.py)
+        self.assertFalse(old["grasp"]["face_align"]["triangle_wait"])  # (sim: on; test_grasp_plan.TestTriangleWait)
         pinned = {"hand", "grasp.point_in_palm", "ik.joint_margin", "grasp.face_align.triangle_phi_deg",
                   "grasp.face_align.cube", "neighbours.margin", "neighbours.floor", "neighbours.order_free", "profile",
                   "grasp.extra_hints", "right_hand_slots", "grasp.face_align.carry_weight",
-                  "grasp.correct.enabled", "sag.enabled"}
+                  "grasp.correct.enabled", "sag.enabled", "grasp.face_align.triangle_height_frac",
+                  "grasp.face_align.triangle_wait"}
+        self.assertIsNone(old["grasp"]["face_align"]["triangle_height_frac"])   # (sim: prisms higher)
 
         def flat(d, pre=""):
             for k, v in d.items():
@@ -933,6 +936,43 @@ class TestBookkeeping(unittest.TestCase):
         r4 = pol._track([self._det("red", 0.405, 0.10)])                                # a red object there is new
         self.assertIsNot(r4[0], r[0])
         self.assertEqual(r4[0]["tries"], 0)
+
+    def test_shape_memory_decides_the_bin(self):
+        """policy.shape_memory: a tracked object whose shape a later look does not accept (None: knocked over, hand
+        over its outline) keeps the bin of the shape earlier looks accepted; not with votes that disagree, a
+        same-colour detection close by (the track may have swapped them) or the option off. The detection's own
+        shape (what the grasp uses) stays None."""
+        def det(color, x, y, shape):
+            d = self._det(color, x, y)
+            d.shape, d.shape_conf = shape, (0.9 if shape else 0.0)
+            return d
+
+        def look(pol, dets):
+            recs = pol._track(dets)
+            pol._shape_memory(dets, recs)
+            return [pol.bin_for(d) for d in dets], recs
+
+        m = {"cube": "left", "cylinder": "center", "triangle": "right"}
+        pol, _ = self._policy([])
+        pol.mapping = dict(m)
+        r = float(pol.cfg["policy"]["same_object_radius"])
+        self.assertEqual(look(pol, [det("red", 0.40, 0.10, "triangle"), det("blue", 0.40, -0.10, "cube")])[0],
+                         ["right", "left"])
+        d = det("red", 0.40 + 0.8 * r, 0.10, None)                  # pushed by a miss, tipped: no shape now
+        bins, recs = look(pol, [d, det("blue", 0.40, -0.10, "cube")])
+        self.assertEqual((bins, d.shape, d.shape_mem, recs[0]["id"]), (["right", "left"], None, "triangle", 0))
+        self.assertIn(":?=tri", pol._shape_note(d))
+        near = det("red", 0.40 + 0.8 * r, 0.10 + 1.5 * r, "cube")    # a red cube close by: no memory for the red ?
+        self.assertEqual(look(pol, [det("red", 0.40 + 0.8 * r, 0.10, None), near])[0], [None, "left"])
+        pol, _ = self._policy([])                                    # votes disagree -> no bin
+        pol.mapping = dict(m)
+        look(pol, [det("red", 0.40, 0.10, "triangle")])
+        look(pol, [det("red", 0.40, 0.10, "cube")])
+        self.assertEqual(look(pol, [det("red", 0.40, 0.10, None)])[0], [None])
+        pol, _ = self._policy([], **{"policy.shape_memory": False})  # option off: as before
+        pol.mapping = dict(m)
+        look(pol, [det("red", 0.40, 0.10, "triangle")])
+        self.assertEqual(look(pol, [det("red", 0.40, 0.10, None)])[0], [None])
 
     def test_untried_first_cap_and_variant(self):
         dets = [self._det("red", 0.30, 0.15), self._det("blue", 0.30, 0.05)]  # red is nearer its bin (nearest_bin)

@@ -323,14 +323,33 @@ grasp:
     lying: true
     lying_max_dev_deg: 100    # ... within this of finger_ref_deg (one of the two always is within 90)
     lying_height_frac: 0.35   # grasp point at this x object height: a prism's ends are 65 % of its width wide there
+    # fingers up to lying_tol_deg off the ridge: the pads stay on the end faces (contact moves sideways by half the
+    # length x tan: 9.5 mm at 22 deg on a 47 mm object, the end ~35 mm wide there, a pad ~16 mm). Tried: the ridge
+    # directions, then turned by these offsets (each with IK tolerance lying_tol_deg - |offset|, at most tol_deg).
+    # OFF (12 / [0] / null = only the two ridge directions, as before): not tried in physics yet. On (22 /
+    # [0, -10, 10] / 0.3) the planner finds a delivery for 36 % instead of 16.5 % of (position, ridge, box) cases with
+    # ik.joint_range, 75 % instead of 61 % in the sim profile
+    lying_tol_deg: 12
+    lying_offsets_deg: [0]
+    # (on: 0.3) from the lift on the end grasp's finger direction only a weak preference (= finger_hint_weight): held
+    # on its ends the prism turns with the hand. At hint_weight (carry_weight null, robot) 272 of 2016 cases (object
+    # band x ridge x arm x box) failed with "carry: no joint-space path above the bin rim"
+    lying_carry_weight: null
     carry_weight: null        # IK weight of the finger direction from the lift on (carry, drop, retreat). null = as
                               # at the grasp (hint_weight): the hand keeps the grasp's direction all the way to the bin
+    triangle_height_frac: null   # a STANDING prism's grasp point at this x object height, every finger direction
+                                 # (planner._candidates; null = grasp.height_frac). Profile sim: see there
+    triangle_wait: false      # an upright triangle whose face-aligned candidates all fail, one on a neighbour: no
+                              # unaligned fallback, the plan fails as blocked (other objects first; least-bad pass
+                              # as before). On in profile sim
   drop_above_rim: 0.04        # grasp point above bin rim + object half size when releasing
   retreat_up: 0.08            # then a joint-space move home: start it high enough to clear the bin rims
   release_posture: release     # hand posture for letting go (hand.<name>); back to `open` on the way home
   arm: by_y                   # by_y = preferred arm first (bin side; centre bin: object side), other on failure | best = plan both, keep the faster
   reach_check: true           # skip an arm at once if IK cannot put its grasp point above the bin at carry height
                               # (cached per arm / bin; on in base since H1, as in the sim profile: faster looks)
+  reach_box_tol: [0.02, 3.0, 0.02]   # that reach test is redone when its box moved more (m, deg, m; null =
+                              # slots.box_tol): a failing one costs 1-2 s (every IK seed and weight); not for noise
   relocate:                   # cross-body: no arm can do object -> bin; pick with one arm, put down where the other can finish
     enabled: true
     max_spots: 6              # counter spots tried (nearest the target bin first)
@@ -349,7 +368,8 @@ grasp:
   # along the fingers, up to 10 mm sideways; free settling leaves p90 0.9 mm drift after 0.2 s, 0.4 mm after 0.3 s.
   correct:
     enabled: true
-    settle_s: 0.3             # dwell before the measurement (arm stationary)
+    settle_s: 0.4             # dwell before the measurement (arm stationary). 0.3 until 2026-11-14: longer for the
+                              # real body's sway (run m32w, with the slower arms below: venue 0.50 not worse)
     obs_lag: 3                # ticks the observation in act() lags the queue (sim runner: 2); part of the dwell
     ramp_s: 0.2               # blend-in, ends where the close starts (phase settle = settle + lag + ramp)
     hold_lift_s: 0.1          # correction kept this long into the lift (object lifts off where it was pinched) ...
@@ -460,7 +480,8 @@ ik:
   seed_weight: 0.03          # pull towards the seed (continuity along Cartesian paths)
   max_iters: 150
   max_step: 0.2
-  random_restarts: 8
+  random_restarts: 4          # (as the sim profile; was 8: Q1 mock grid 2026-11-14, 18 robot-profile episodes at
+                              # boxes 0.40 / 0.47 / 0.50: the same objects delivered per seed, planning time -22 %)
 
 motion:
   # H1 (2026-11-14): the old 0.5 / 1.5 / hand 1.2 / holds 0.4 took ~20 s per object (real_like episodes; mock world
@@ -469,8 +490,12 @@ motion:
   # the venue variant's grid). Real arm (teleop recordings): a damped low-pass, 90 % of a step in 0.13-0.2 s, ~0.5 s
   # to settle after a ~1 rad/s move: the 0.6 s settle-and-correct dwell before the close covers it. Real fingers: half
   # a step in 0.1-0.17 s (the sim variant: 63 % of 0.75 rad in 0.27 s): close_hold 0.3 s after the ramp.
-  arm_max_vel: 0.9            # rad/s per joint (safety filter allows 1.0)
-  arm_max_acc: 5.0            # rad/s^2 (operators' carries: hand up to 2.4 m/s^2 p50, 3.5 p90, objects held)
+  arm_max_vel: 0.75           # rad/s per joint (safety filter allows 1.0). 0.9 until 2026-11-14: slower for the real
+                              # robot (it stands on its legs: fast arms shake the body; margin if the finals' speed
+                              # cap is tighter). Run m32w (0.75 / 4.0 / dwell 0.4) vs m32 on the same venue seeds:
+                              # not fewer objects, episodes 13-34 % longer (the longest 83 s of 120)
+  arm_max_acc: 4.0            # rad/s^2 (operators' carries: hand up to 2.4 m/s^2 p50, 3.5 p90, objects held). 5.0
+                              # until 2026-11-14 (see arm_max_vel)
   hand_max_vel: 2.5           # rad/s (filter allows 3.0)
   cart_step: 0.02             # Cartesian segments are split into IK waypoints this far apart
   max_joint_step: 0.4         # rad between neighbouring Cartesian IK waypoints (more = branch flip, bisect / fail)
@@ -539,9 +564,21 @@ policy:
   same_object_radius: 0.03    # m from the object's last known or last attempted position (a missed grasp pushes it)
   replan_moved: 0.03          # an object whose plan failed is planned again only after it moved this far
   order: nearest_bin          # nearest_bin | largest (objects not tried yet always come before retries)
-  look_budget_s: 3.0          # wall s of planning per look: when over, no further object is planned in this look (the
-                              # ones that failed stay failed until they move), the robot holds and looks again. null =
-                              # no budget (profile sim). Boxes no arm can reach are skipped before planning anyway
+  # Wall-clock budget per look (s; null = off): on the robot planning time is episode time, the arms hold at home.
+  # Past it the planner's searches stop (Planner.check_budget: between candidates, arms, carry tries, Cartesian steps,
+  # relocation spots, before every IK); the policy looks again at once and resumes in the same object order
+  # (nothing marked failed; every grasp candidate's result is remembered for the same object place and
+  # neighbours, so the search goes on where it stopped and ends with the plan an uninterrupted one finds; never a
+  # "best so far"). Every look logs (server log) `plan: X s wall (slots, neighbours, carry, dry-run, ik, far;
+  # perception; still; plans; budget hits)`.
+  # (policy.look_budget_s, the earlier per-look budget: an alias of plan_budget_s when that is null.)
+  plan_budget_s: 2.0
+  budget_max: null            # interruptions after which an object is skipped until it moves (null: never; the
+                              # episode's time limit ends it; a cap loses objects whose search needs a few looks)
+  # an object's shape from earlier looks decides its bin when a look accepts none (policy._shape_memory: a missed
+  # grasp knocked the prism over, a hand hides the outline). m25o_lang_all: 3 of the 7 objects left were prisms
+  # recognised (tri .91-.93) until a miss tipped them, then `?` = no bin under a shape instruction, tries left
+  shape_memory: true
 
 # Grasp verification (verify.py): sig = closing shortfall of the grasping hand's finger joints while the closed
 # posture is commanded; fingers on an object stop short of it. On here (H1, 2026-11-14): a missed close otherwise
@@ -654,7 +691,6 @@ profiles:
     # box detection runs and is logged; the scene.yaml boxes (the camera registered on them) drive everything
     perception.boxes.mode: "log"
     grasp.far.enabled: false          # (far.py: the published boxes are in reach; the boxes are not detected here)
-    policy.look_budget_s: null        # (as tuned: no planning budget per look)
     still.enabled: false              # the sim's head camera does not move (the gate would cost 0.17 s per look)
     # what levelling + registration leave on the 150 nominal frames (fitted centres, mean of -3.4, -1.2 mm): the sim's
     # head camera / pelvis is not exactly where calibration.yaml + scene.yaml put it in a way the counter and the bins
@@ -758,6 +794,17 @@ profiles:
     # triangle poses, 56 cases: 14 lost their aligned grasp to "carry: no joint-space path above the bin rim" with
     # the direction kept
     grasp.face_align.carry_weight: 0.3
+    # standing prisms pinched higher: at mid-height the pinch lifts and tilts the prism (z +2-6 mm, 5-35 deg during
+    # the close) and it squeezes out. Evaluations (m25o_lang_all + m25o/m27o_cam_train): prisms held on 26 of 65
+    # attempts (cubes 43/43, cylinders 61/63), all 7 objects m25o_lang_all left were prisms after misses. Grasp lab,
+    # friction x0.8 / mass x1.3, left arm, mat x 0.30 / 0.58, 5 yaws: height_frac 0.35: 4/10, 0.5: 6/10, 0.65: 8/10,
+    # 0.8: 8/10 (every face-aligned case held at 0.65 / 0.8; the 2 misses are stock-hint cross-body grasps)
+    grasp.face_align.triangle_height_frac: 0.65
+    # Train evaluations m25o / m27o / s2m / x1 (seeds 1000-1009, 2026-11-14): upright triangles on the stock hints (the
+    # face-aligned grasp blocked by a neighbour 9 cm away) held 0 of 8 tries (seed 1009: 4 identical misses in a row,
+    # the triangle left on the counter in every run), face-aligned 17 of 25. So such a triangle waits until its
+    # neighbour has gone (planning replay of seed 1009: the aligned grasp then plans)
+    grasp.face_align.triangle_wait: true
     neighbours.enabled: true
     neighbours.margin: 0.005
     # least-bad (last resort when nothing else can be planned; else the object stays on the counter: 0 points).
@@ -779,6 +826,7 @@ profiles:
     verify.confirm: 2
     verify.abort_open_margin: null    # (robot rule; the sim's signal had no wrong "empty" in 259 checked grasps)
     policy.max_attempts: 5
+    policy.plan_budget_s: null        # (sim: planning time is hidden by the slow sim clock; behaviour as measured)
     policy.same_object_radius: 0.06   # a missed grasp pushes the object 2-3 cm
     two_arm.enabled: true             # paired two-arm cycle (offline mock only so far; min_clearance as base)
     two_arm.avoid_parked: true        # single-arm plans keep clear of the parked arm (evade, else skip)
@@ -828,6 +876,8 @@ profiles:
     neighbours.order_free: 0.07
     grasp.extra_hints: []             # (sim adds finger directions for objects in front of the bins)
     grasp.face_align.carry_weight: null   # (the hand keeps the grasp's finger direction to the bin, as it did)
+    grasp.face_align.triangle_height_frac: null   # (prisms at grasp.height_frac, as they were)
+    grasp.face_align.triangle_wait: false # (blocked triangles fall back to the stock hints, as they did)
     right_hand_slots: null            # (index and middle get the same values in these postures: no difference)
     grasp.correct.enabled: false      # (the mock tests' timing / seeds predate the settle phase; own tests on sim)
     sag.enabled: false                # (the same: seeds / timing predate the feed-forward; own tests on sim / none)

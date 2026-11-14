@@ -49,10 +49,20 @@ joint space; what the policy sends is commanded() = intended + the feed-forward 
 not change while a plan is planned or executed). So the safety dry run (dry_run_safety: joint limits, speed, workspace
 box, counter keep-out) runs on the commanded ticks, and every time-scaled move (_timed) is slowed where the commanded
 ticks would exceed sag.max_cmd_vel (the offset's own speed adds G * d tau / dt). Off (ff None / disabled): unchanged.
+Planning time (98 % of it is IK): solve() = kin.solve with a strict arm-length bound (targets beyond it fail at once)
+and a memo of exact repeats; the least-bad search skips candidates whose grasp pose already has less clearance than the
+best found (same choice, up to the 1 mm ties). Per look the policy sets `deadline` (policy.plan_budget_s): searches
+stop at check_budget() (between candidates, arms, carry tries, Cartesian steps, relocation spots, before every IK)
+with PlanBudget; plan() then returns a failure with .budget. With a deadline, every grasp candidate's result is
+remembered (_plan_side_memo) and the IK memo lives for the episode, so the next look resumes and ends with the plan an
+uninterrupted search finds (never a "best so far": a least-bad or far choice cut short could be a worse one). `prof`:
+wall time per part (PROF_KEYS) since prof_reset().
 """
 from __future__ import annotations
 
 import copy
+import functools
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -68,6 +78,27 @@ from .kinematics import ARM_MIRROR, ArmKinematics, cylinder_distance
 
 PAIR_CHECK_STEP = 1  # ticks between arm-arm clearance checks of a merged pair (2 was not a guarantee: the distance can
                      # change by up to ~14 mm per tick away from its minimum; 1 costs ~5 ms more per lag tried)
+PROF_KEYS = ("slots", "neighbours", "carry", "dry-run", "ik", "far")   # Planner.prof: wall s per part (policy plan:
+                                       # line; the parts overlap: ik = every IK solve, far = the boxes' far decisions)
+
+
+class PlanBudget(Exception):
+    """Planner.deadline (policy.plan_budget_s) has passed: the search stops at the next check (Planner.check_budget);
+    plan() / plan_side() return a failed Plan with .budget set."""
+
+
+def _part(key):
+    """Method decorator: its wall time is added to self.prof[key] (PROF_KEYS)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrap(self, *a, **kw):
+            t0 = time.perf_counter()
+            try:
+                return fn(self, *a, **kw)
+            finally:
+                self.prof[key] = self.prof.get(key, 0.0) + time.perf_counter() - t0
+        return wrap
+    return deco
 
 
 @dataclass
@@ -97,6 +128,7 @@ class Plan:
     least_bad: bool = False                            # accepted by the least-bad rule (neighbours.floor)
     face: float | None = None                          # face-aligned grasp: finger direction (deg, pelvis)
     far: dict | None = None                            # grasp.far release (far.py): pose, predicted landing, margins
+    budget: bool = False                               # failed: Planner.deadline passed (search not finished)
 
     @property
     def duration(self):
@@ -278,6 +310,80 @@ class Planner:
         self._reach_box = {}    # (side, bin) -> the Box its reach test was made for
         self.far = FarDelivery(self)   # grasp.far (far.py): detected boxes without a reachable drop slot
         self.far_alt = 0               # far.release(alt=...) of the next plans (the policy: a retry after a short miss)
+        self._bar, self._bar_on = None, False   # least-bad pass: best slack so far (prunes candidates that cannot win)
+        self.lb_prune = True    # (tests: False = every least-bad candidate planned in full, as before)
+        self.deadline = None    # policy.plan_budget_s: time.perf_counter() after which a search stops (PlanBudget)
+        self.prof = dict.fromkeys(PROF_KEYS, 0.0)   # wall s per part since prof_reset() (policy: per look)
+        self._ik_memo = {}      # solve(): exact repeats within a look
+        self._bound = {}        # reach_bound(): (side, kinematics state) -> (shoulder origin, arm length)
+        self.fail_memo = {}     # _plan_side_memo: failed candidates (with a deadline only; cleared per episode)
+        self._ik_est = {}       # solve(): running estimate of one kin.solve's wall time (s), by restarts flag
+        self._solves = 0        # kin.solve calls since prof_reset (the first of a look always runs)
+
+    # ------------------------------------------------------------------ planning time (policy.plan_budget_s)
+    def prof_reset(self, keep_memo=False):
+        """Per look: zero the timers; clear the IK memo unless keep_memo (the policy with a budget: per episode)."""
+        self.prof = dict.fromkeys(PROF_KEYS, 0.0)
+        if not keep_memo:
+            self._ik_memo = {}
+        self._solves = 0
+
+    def solve(self, side, target, seed, top_down=True, extra_seeds=(), restarts=True):
+        """kin.solve for the planner's searches, the same result faster: (1) a target farther from the shoulder than
+        the arm's length (reach_bound: sum of its links, a strict bound) fails at once instead of after every seed
+        and orientation weight (~1-2 s each on the robot profile: boxes out of reach); (2) a call repeated with the
+        same inputs (target, seed, extra seeds, finger hint and weight, flags) returns the earlier result (the least-
+        bad pass re-plans the grasps of the first pass; the memo is cleared per look, prof_reset). Past the deadline
+        it raises PlanBudget (each IK is a budget check)."""
+        if self._solves:   # (the first solve of a look always runs: every look makes progress)
+            self.check_budget(self._ik_est.get(bool(restarts), 0.0))
+        target = np.asarray(target, float)
+        o, bound = self.reach_bound(side)
+        d = float(np.linalg.norm(target - o))
+        if d > bound + float(self.cfg["ik"]["pos_tol"]):
+            return np.asarray(seed, float).copy(), False, d - bound, 0.0
+        key = (side, target.tobytes(), np.asarray(seed, float).tobytes(), bool(top_down), bool(restarts),
+               b"".join(np.asarray(e, float).tobytes() for e in extra_seeds),
+               np.asarray(self.kin.hint, float).tobytes(), float(self.kin.w_hint))
+        hit = self._ik_memo.get(key)
+        if hit is None:
+            if len(self._ik_memo) > 20000:
+                self._ik_memo.clear()
+            t0 = time.perf_counter()
+            hit = self._ik_memo[key] = self.kin.solve(side, target, seed, top_down=top_down, extra_seeds=extra_seeds,
+                                                      restarts=restarts)
+            dt = time.perf_counter() - t0
+            self.prof["ik"] = self.prof.get("ik", 0.0) + dt
+            e = self._ik_est.get(bool(restarts))
+            self._ik_est[bool(restarts)] = dt if e is None else 0.7 * e + 0.3 * dt
+            self._solves += 1
+        return hit[0].copy(), hit[1], hit[2], hit[3]
+
+    def reach_bound(self, side):
+        """(shoulder pitch joint origin (3,), arm length m): no grasp point lies farther from that origin than the
+        sum of the distances between consecutive arm joint origins plus wrist yaw -> grasp point (triangle
+        inequality on rigid links; lower body as the kinematics model holds it). Cached per kinematics state."""
+        k = self.kin
+        key = (side, id(k), k.q0.tobytes(), k.offset[side].tobytes())
+        if key not in self._bound:
+            pin, m, d = k.pin, k.model, k.data
+            pin.forwardKinematics(m, d, k.q0)
+            names = [n for n in k.spec.arm_names if n.startswith(side)]
+            O = [d.oMi[m.getJointId(n)].translation.copy() for n in names]
+            pin.updateFramePlacements(m, d)
+            M = d.oMf[k.palm[side]]
+            g = M.translation + M.rotation @ k.offset[side]
+            L = sum(float(np.linalg.norm(b - a)) for a, b in zip(O, O[1:])) + float(np.linalg.norm(g - O[-1]))
+            self._bound[key] = (O[0], L)
+        return self._bound[key]
+
+    def check_budget(self, ahead=0.0):
+        """Raise PlanBudget once the deadline has passed, or would pass within `ahead` s (solve(): the running
+        estimate of an IK solve's time, from the second solve of a look on). Called between search steps (candidates,
+        arms, carry tries, Cartesian steps, relocation spots) and before every IK: anything they call falls under the
+        same budget."""
+        if self.deadline is not None and time.perf_counter() + ahead > self.deadline:
+            raise PlanBudget()
 
     def set_boxes(self, boxes):
         """Use these boxes (bins.Boxes: perception.boxes.mode on) from now on. Cached slots / reach tests are checked
@@ -309,7 +415,7 @@ class Planner:
         plan searches every finger direction and relocation spot: tens of seconds for an object out of reach.)"""
         g = self.cfg["grasp"]
         p = np.r_[det.top[:2], self.scene.counter_z + g["height_frac"] * self.height]
-        return any(self.kin.solve(s, p, self.home)[1] for s in ("left", "right"))
+        return any(self.solve(s, p, self.home)[1] for s in ("left", "right"))
 
     def box_grade(self, name):
         """'sure' | 'marginal' | None: the best delivery any arm has into box `name` (can_deliver; marginal = the far
@@ -324,10 +430,10 @@ class Planner:
             return True, ""
         return False, "; ".join(f"{s}: {how}" for s, _, how in res)
 
-    def _moved(self, a, b):
-        """Box a vs b beyond grasp.slots.box_tol (m, deg, m: centre / size, yaw, rim); a None (slots set by hand,
-        the oracle's copy): never."""
-        tol = (self.cfg["grasp"].get("slots") or {}).get("box_tol") or [0.005, 1.0, 0.005]
+    def _moved(self, a, b, tol=None):
+        """Box a vs b beyond grasp.slots.box_tol (m, deg, m: centre / size, yaw, rim; or `tol`); a None (slots set by
+        hand, the oracle's copy): never."""
+        tol = tol or (self.cfg["grasp"].get("slots") or {}).get("box_tol") or [0.005, 1.0, 0.005]
         return a is not None and a.moved(b, tol[0], tol[1], tol[2])
 
     # ------------------------------------------------------------------ sag feed-forward (config sag)
@@ -434,14 +540,15 @@ class Planner:
         sc, g = self.scene, self.cfg["grasp"]
         wall = self.boxes.max_rim() if wall is None else float(wall)
         zc, tilt = sc.counter_z, np.radians(float(g["slots"].get("max_tilt_deg", 10.0)))
-        q1, ok1, _, t1 = self.kin.solve(side, np.r_[xy, zc + max(g["carry_height"], self.boxes.max_rim() + self.height
+        q1, ok1, _, t1 = self.solve(side, np.r_[xy, zc + max(g["carry_height"], self.boxes.max_rim() + self.height
                                                               + 0.03)], self.home, restarts=False)
         if not ok1 or t1 > tilt:
             return False
-        _, ok2, _, t2 = self.kin.solve(side, np.r_[xy, zc + wall + self.height / 2 + g["drop_above_rim"]], q1,
-                                       restarts=False)
+        _, ok2, _, t2 = self.solve(side, np.r_[xy, zc + wall + self.height / 2 + g["drop_above_rim"]], q1,
+                                   restarts=False)
         return bool(ok2 and t2 <= tilt)
 
+    @_part("slots")
     def _make_slots(self, name, side):
         """Rows parallel to the bin's near wall, inside its inner footprint inset by slots.wall_clear. Row 0 (nearest
         the pelvis): from the reachable extent of that line (the ends bisected towards the stock drop point until
@@ -551,6 +658,7 @@ class Planner:
         finally:
             self._nb, self._nb_tags, self._least = saved
 
+    @_part("neighbours")
     def neighbour_clearance(self, side, arm_q, hand_q, arm, hand, cyl=None, kin=None):
         """Sphere-model distance (m) of `side`'s arm to each neighbour cylinder at the start pose arm_q / hand_q and
         at every tick of (arm, hand): (d0 (m,), D (T, m)). cyl default: the current plan call's neighbours."""
@@ -665,7 +773,7 @@ class Planner:
 
     # ------------------------------------------------------------------ IK helpers
     def _ik(self, side, p, seed, name, plan):
-        q, ok, err, tilt = self.kin.solve(side, p, seed, top_down=True, extra_seeds=[self.home[ArmKinematics.sl(side)]])
+        q, ok, err, tilt = self.solve(side, p, seed, top_down=True, extra_seeds=[self.home[ArmKinematics.sl(side)]])
         plan.ik[name] = (ok, err, float(np.degrees(tilt)))
         plan.waypoints[name] = np.asarray(p, float)
         return q, ok
@@ -680,7 +788,7 @@ class Planner:
         jmax = float(self.cfg["motion"].get("max_joint_step", 0.4))
 
         def seg(pa, pb, q, depth):
-            qn, ok, err, tilt = self.kin.solve(side, pb, q, top_down=True, restarts=False)
+            qn, ok, err, tilt = self.solve(side, pb, q, top_down=True, restarts=False)
             if ok and np.abs(qn - q).max() <= jmax:
                 info[1], info[2] = max(info[1], err), max(info[2], float(np.degrees(tilt)))
                 return [qn]
@@ -693,6 +801,7 @@ class Planner:
             return a + b if b else None
 
         for k in range(1, n + 1):
+            self.check_budget()
             out = seg(p0 + (p1 - p0) * (k - 1) / n, p0 + (p1 - p0) * k / n, q, 0)
             if out is None:
                 plan.ik[name] = (False, info[1], info[2])
@@ -720,6 +829,7 @@ class Planner:
                 return qs
         return [q1]
 
+    @_part("carry")
     def _carry(self, side, q0, p0, p1, z_drop, plan):
         """lift -> above_bin: Cartesian, else joint space (grasp point above z_drop). motion.joint_carry_first: joint
         space first (usually the shorter joint path), grasp point above the bin drop height (also for a relocation)."""
@@ -758,10 +868,12 @@ class Planner:
         def low(qa, qb):
             return any(self.kin.grasp_pose(side, qa + f * (qb - qa))[0][2] < z_min for f in np.linspace(0, 1, 15))
 
+        self.check_budget()
         q_to, ok = self._ik(side, p_to, q_from, name, plan)
         if ok and not low(q_from, q_to):
             return [q_to]
         for dz in (0.06, 0.12):
+            self.check_budget()
             mid = 0.5 * (np.asarray(p_from, float) + p_to) + [0, 0, dz]
             q_mid, ok1 = self._ik(side, mid, q_from, name + "_mid", plan)
             if not ok1 or low(q_from, q_mid):
@@ -787,9 +899,14 @@ class Planner:
         neighbours: the other objects (Detections) every tick must keep clear of (config neighbours); a failure
         caused by one has .blocked (then no relocation: taking another object first frees this one). least_bad:
         neighbours.floor instead of .margin, both arms planned, the most clearance wins.
-        Returns the first Plan that passes every check, else the last failure."""
-        return self._scoped(neighbours, least_bad, self._plan, det, arm_q, hand_q, bin_name, obstacles, relocate,
-                            variant)
+        Returns the first Plan that passes every check, else the last failure (Planner.deadline passed: .budget)."""
+        self._bar, self._bar_on = None, False   # least-bad: best slack so far of the pick -> bin candidates
+        try:
+            return self._scoped(neighbours, least_bad, self._plan, det, arm_q, hand_q, bin_name, obstacles, relocate,
+                                variant)
+        except PlanBudget:    # a failure the policy plans again next look (memos: it resumes, the same result as an
+            # uninterrupted search; no "best so far": a least-bad or far choice cut short could be a worse one)
+            return Plan(False, color=det.color, reason="plan budget exceeded", budget=True, variant=int(variant))
 
     def _plan(self, det, arm_q, hand_q, bin_name, obstacles, relocate, variant):
         g = self.cfg["grasp"]
@@ -812,10 +929,18 @@ class Planner:
         if centre and variant % 2:
             sides = sides[::-1]
         rot = variant // 2 if centre else variant
+        if getattr(det, "lying", False):   # an arm that can hold its two ends first (cheap test); none: left at once
+            ok = [s for s in sides if self.end_grasp_reach(det, s)]
+            if not ok:
+                return Plan(False, color=det.color, reason=self._no_end_grasp(det))
+            sides = tuple(ok + [s for s in sides if s not in ok])
         reasons, good, blocked = [], [], False
         for side in sides:
+            self.check_budget()
+            self._bar_on = True
             p = self._plan_side_hints(det, side, bin_name, np.asarray(arm_q, float), np.asarray(hand_q, float),
                                       variant=rot)
+            self._bar_on = False
             p.variant = variant
             if p.ok:
                 if g.get("arm", "best") != "best" and (not self._least or self._good_enough(p)):
@@ -851,6 +976,8 @@ class Planner:
         from as if delivered (grasp.slots: the first plan's drop point). neighbours: as plan()."""
         by = self.bin_xy(bin_name)[1]
         rot = int(variant) // 2 if abs(by) <= 0.1 else int(variant)
+        if getattr(det, "lying", False) and not any(self.end_grasp_reach(det, s) for s in ("left", "right")):
+            return Plan(False, side=side, color=det.color, reason=self._no_end_grasp(det), variant=int(variant))
         saved, avoid = dict(self.drop_offsets), self._drop_avoid
         if drop_offset is not None:
             self.drop_offsets[bin_name] = drop_offset
@@ -858,6 +985,8 @@ class Planner:
         try:
             p = self._scoped(neighbours, None, self._plan_side_hints, det, side, bin_name, np.asarray(arm_q, float),
                              np.asarray(hand_q, float), variant=rot)
+        except PlanBudget:
+            p = Plan(False, side=side, color=det.color, reason="plan budget exceeded", budget=True)
         finally:
             self.drop_offsets, self._drop_avoid = saved, avoid
         p.variant = int(variant)
@@ -1098,6 +1227,7 @@ class Planner:
         last = Plan(False, color=det.color, reason="no relocation spot")
         H = self.height
         for spot in self.relocation_spots(det, bin_name, obstacles):
+            self.check_budget()
             d2 = replace(det, top=np.r_[spot, self.scene.counter_z + H])
             by = self.bin_xy(bin_name)[1]
             fin_side = "left" if (by if abs(by) > 0.1 else spot[1]) > 0 else "right"
@@ -1114,15 +1244,17 @@ class Planner:
             last.reason = f"{side} cannot place at ({spot[0]:+.2f},{spot[1]:+.2f}): {p.reason}"
         return last
 
+    @_part("slots")
     def _reaches_bin(self, side, bin_name):
         """Cheap reach test (cached per planner): can this arm put its grasp point above the bin at carry height at
         all? A cross-body attempt otherwise spends 10-30 s in the joint-space carry search before it fails."""
         key = (side, bin_name)
-        if key not in self._reach or self._moved(self._reach_box.get(key), self.boxes[bin_name]):
+        tol = self.cfg["grasp"].get("reach_box_tol")   # (coarser than slots.box_tol: detection noise, one IK each)
+        if key not in self._reach or self._moved(self._reach_box.get(key), self.boxes[bin_name], tol):
             g, sc = self.cfg["grasp"], self.scene
             z = sc.counter_z + max(g["carry_height"], self.boxes.max_rim() + self.height + 0.03)
             xy = self.drop_xy(bin_name, offset=False)
-            self._reach[key] = bool(self.kin.solve(side, np.r_[xy, z], self.home)[1])
+            self._reach[key] = bool(self.solve(side, np.r_[xy, z], self.home)[1])
             self._reach_box[key] = self.boxes[bin_name]
         return self._reach[key]
 
@@ -1184,6 +1316,76 @@ class Planner:
         k = int(variant) % len(cands) if cands else 0
         return cands[k:] + cands[:k]
 
+    def lying_cands(self, det, side, variant=0):
+        """[(finger direction rad, IK tolerance deg)] of a lying object's end grasp: each lying_dirs direction, then
+        the same turned by face_align.lying_offsets_deg (nearest first). The tolerance keeps the fingers within
+        lying_tol_deg of the ridge in every case (offset + tolerance): with the pads on the two ends and a rotated pinch
+        axis the contacts move sideways on the end faces by half the length x tan(angle): at lying_height_frac the end
+        is ~65 % of the width wide (~35 mm for 47 mm objects), a ~16 mm pad stays on it up to ~22 deg."""
+        fa = self.cfg["grasp"].get("face_align") or {}
+        tol, lim = float(fa.get("tol_deg", 12.0)), float(fa.get("lying_tol_deg", fa.get("tol_deg", 12.0)))
+        offs = sorted((float(o) for o in fa.get("lying_offsets_deg") or [0.0]), key=abs)
+        return [(a + np.radians(o), min(tol, lim - abs(o))) for o in offs for a in self.lying_dirs(det, side, variant)
+                if lim - abs(o) > 0]
+
+    def end_grasp_reach(self, det, side):
+        """Can `side` hold a lying object's end grasp at all (lying_cands: fingers along the ridge, within their
+        tolerance, top-down) at the grasp (raised for fingertip clearance) and the pregrasp height, as a plan
+        (_plan_side), from home? A few IK solves, cached per (side, xy to 5 mm, ridge to 5 deg, carry height): with
+        ik.joint_range (robot) one or both arms often cannot turn the wrist there, and a full plan takes seconds
+        (up to ~15 s over every candidate) to find that out."""
+        if not hasattr(self, "_end_reach"):
+            self._end_reach = {}
+        g, fa = self.cfg["grasp"], self.cfg["grasp"].get("face_align") or {}
+        zc, H = self.scene.counter_z, self.height
+        z_carry = zc + max(g["carry_height"], self.boxes.max_rim() + H + 0.03)
+        key = (side, tuple(np.round(np.asarray(det.top[:2]) / 0.005).astype(int)),
+               int(round(np.degrees(det.ridge_yaw or 0.0) / 5.0)) % 36, int(round(z_carry / 0.005)))
+        if key not in self._end_reach:
+            z0 = zc + float(fa.get("lying_height_frac", g["height_frac"])) * H
+            z_max = zc + H - 0.008        # (the plan's own limit: above the object top)
+            sl = ArmKinematics.sl(side)
+            hand_pre = self.post["open"].copy(); hand_pre[sl] = self.post["preshape"][sl]
+            saved, ok = (self.kin.hint, self.kin.w_hint), False
+
+            def reach(q, zz, a, tol):     # top-down IK at height zz, fingers within tol of a; None if not
+                q, good, _, _ = self.kin.solve(side, np.r_[det.top[:2], zz], q, top_down=True,
+                                               extra_seeds=[self.home[sl]])
+                self.kin._fk(q)
+                x = self.kin.data.oMf[self.kin.palm[side]].rotation[:, 0]
+                e = abs((np.arctan2(x[1], x[0]) - a + np.pi) % (2 * np.pi) - np.pi)
+                return q if good and np.degrees(e) <= tol else None
+
+            try:
+                for a, tol in self.lying_cands(det, side):
+                    self.kin.hint = np.array([np.cos(a), np.sin(a), 0.0])
+                    self.kin.w_hint = float(fa.get("hint_weight", 3.0))
+                    z, qg = z0, None
+                    for _ in range(4):            # the grasp, raised for fingertip clearance (as a plan)
+                        qg = reach(self.home, z, a, tol)
+                        if qg is None:
+                            break
+                        c = self.clearance(side, qg, hand_pre, fingers_only=True)
+                        if c >= g["fingertip_clearance"] - 1e-3:
+                            break
+                        z += g["fingertip_clearance"] - c
+                        qg = None
+                        if z > z_max:
+                            break
+                    # the pregrasp from the grasp's IK branch (as a plan)
+                    ok = qg is not None and reach(qg, max(z + g["approach_height"], z_carry), a, tol) is not None
+                    if ok:
+                        break
+            finally:
+                self.kin.hint, self.kin.w_hint = saved
+            self._end_reach[key] = ok
+        return self._end_reach[key]
+
+    @staticmethod
+    def _no_end_grasp(det):
+        shape = {"triangle": "prism"}.get(getattr(det, "shape", None), getattr(det, "shape", None) or "object")
+        return f"lying {shape} at ridge {np.degrees(det.ridge_yaw or 0.0):.0f} deg: no end grasp within the joint range"
+
     def _candidates(self, det, side, variant=0):
         """Grasp candidates for one arm, in the order tried: [(finger direction (3,), IK hint weight, detection to
         plan (triangle: shifted to the pinch midpoint), tolerance deg (None: no check), hint index, face deg)].
@@ -1214,8 +1416,13 @@ class Planner:
         if getattr(det, "lying", False):       # lying: only the pinch on its two flat ends, at lying_height_frac
             d2 = copy.copy(det)                # (where the ends are wide enough for the pads); nothing else
             d2.grasp_height_frac = float(fa.get("lying_height_frac", g["height_frac"]))
-            return [dict(f=np.array([np.cos(a), np.sin(a), 0.0]), w=w_face, det=d2, tol=tol, hint=None,
-                         deg=float(np.degrees(a)), kind="face") for a in self.face_dirs(det, side, variant)]
+            d2.carry_weight = fa.get("lying_carry_weight")   # held: the hand may turn on the way to the box
+            return [dict(f=np.array([np.cos(a), np.sin(a), 0.0]), w=w_face, det=d2, tol=t, hint=None,
+                         deg=float(np.degrees(a)), kind="face") for a, t in self.lying_cands(det, side, variant)]
+        thf = fa.get("triangle_height_frac")   # a standing prism: pinched this high (every candidate below)
+        if thf is not None and det.shape == "triangle" and getattr(det, "grasp_height_frac", None) is None:
+            det = copy.copy(det)
+            det.grasp_height_frac = float(thf)
         r_tri = self.scene.object_dims("triangle")["circumradius"]
         for a in self.face_dirs(det, side, variant):
             f = np.array([np.cos(a), np.sin(a), 0.0])
@@ -1241,16 +1448,25 @@ class Planner:
         IK reaches the direction within face_align.tol_deg), then the finger hints (fingers forward can reach over
         the centre bin's wall when the object is close to it; then fingers inward/sideways). First plan that passes
         wins; least-bad pass: all are planned, the most neighbour clearance wins (1 mm ties: candidate order).
-        Failure: the first one that a neighbour blocked (.blocked), else the first finger-hint failure."""
+        Failure: the first one that a neighbour blocked (.blocked), else the first finger-hint failure.
+        grasp.face_align.triangle_wait (not in the least-bad pass): an upright triangle whose face-aligned candidates
+        all failed, one of them on a neighbour, gets no unaligned candidate: the plan fails as blocked (the policy
+        takes the other objects first, then plans it again; the least-bad pass still tries everything)."""
         rej = self._reach_reject(det, side, bin_name, kw.get("place_xy"))
         if rej is not None:
             return rej
         saved = (self.kin.hint, self.kin.w_hint)
         first = blocked = best = p = None
+        wait = (bool((self.cfg["grasp"].get("face_align") or {}).get("triangle_wait")) and not self._least
+                and getattr(det, "shape", None) == "triangle" and not getattr(det, "lying", False))
         try:
             for c in self._candidates(det, side, variant):
+                if wait and c["kind"] != "face" and blocked is not None:   # (face candidates come first)
+                    blocked.reason = f"aligned triangle grasp blocked: {blocked.reason}"
+                    break
+                self.check_budget()
                 self.kin.hint, self.kin.w_hint = c["f"], saved[1] if c["w"] is None else c["w"]
-                p = self._plan_side(c["det"], side, bin_name, arm_q, hand_q, **kw)
+                p = self._plan_side_memo(c, side, bin_name, arm_q, hand_q, **kw)
                 p.hint, p.face = c["hint"], c["deg"] if c["kind"] == "face" else None
                 if p.ok and c["tol"] is not None:
                     err = self._finger_err(p, side, c["f"])
@@ -1266,6 +1482,8 @@ class Planner:
                         p.least_bad = True
                     if not self._least or self._good_enough(p):
                         return p
+                    if self._bar_on:
+                        self._bar = max(_slack(p), -np.inf if self._bar is None else self._bar)
                     if best is None or _slack(p) > _slack(best) + 1e-3:
                         best = p
                     continue
@@ -1279,6 +1497,33 @@ class Planner:
             return out
         finally:
             self.kin.hint, self.kin.w_hint = saved
+
+    def _plan_side_memo(self, c, side, bin_name, arm_q, hand_q, place_xy=None):
+        """_plan_side for grasp candidate c; with a deadline (policy.plan_budget_s: the robot profile) the result of
+        an earlier call this episode is reused, so the next look resumes where a budget stopped the last one and ends
+        with the plan an uninterrupted search finds: a failure for the same object place, release point, neighbours
+        (2 mm grid), start pose and settings; a plan only for exactly the same inputs (the policy keeps a still
+        object's pose: _snap). Both keyed also on the box's deliveries (drop_used), far_alt and the feed-forward
+        version. Off without a deadline (the sim profile plans as before)."""
+        if self.deadline is None:
+            return self._plan_side(c["det"], side, bin_name, arm_q, hand_q, place_xy=place_xy)
+        g = 0.002
+        r = lambda a, q: tuple(np.round(np.asarray(a, float).ravel() / q).astype(int).tolist())
+        nb = () if self._nb is None else tuple(sorted(r(row, g) for row in self._nb))
+        state = (side, bin_name, c["kind"], r(c["f"], 1e-3), c["w"],
+                 r(place_xy if place_xy is not None else self._drop_point(bin_name, side), g), nb, self._least,
+                 round(1000 * self.boxes.max_rim()), tuple(sorted(r(u, g) for u in self.drop_used.get(bin_name, ()))),
+                 tuple(r(u, g) for u in self._drop_avoid), int(self.far_alt),
+                 self.ff.version if self.ff_on() else None)
+        fkey = state + (r(c["det"].top, g), r(arm_q, 1e-3), r(hand_q, 1e-3))
+        okey = state + (np.asarray(c["det"].top, float).tobytes(), np.asarray(arm_q, float).tobytes(),
+                        np.asarray(hand_q, float).tobytes(), getattr(c["det"], "grasp_height_frac", None))
+        hit = self.fail_memo.get(okey) or self.fail_memo.get(fkey)
+        if hit is not None:
+            return copy.deepcopy(hit)
+        p = self._plan_side(c["det"], side, bin_name, arm_q, hand_q, place_xy=place_xy)
+        self.fail_memo[okey if p.ok else fkey] = copy.deepcopy(p)
+        return p
 
     def _finger_err(self, plan, side, f):
         """Angle (deg) between the palm x axis (finger direction) at the grasp and f, in the horizontal plane."""
@@ -1328,6 +1573,13 @@ class Planner:
                 plan.reason = (f"hand {1000 * D[k, j]:.0f} mm from {self._nb_tags[j]} at the grasp "
                                f"({('preshaped', 'closing', 'closed')[k]}; need {1000 * need[j]:.0f})")
                 return plan
+            if self._least and self._bar_on and self._bar is not None and self.lb_prune:   # cannot beat the best
+                Dg = D[[0, 2]]   # (preshaped / closed at the grasp pose: in every plan of it; its slack <= theirs)
+                good = float((self.cfg.get("neighbours") or {}).get("least_bad_good", 0.0))
+                if float((Dg - need).min()) < self._bar - 0.002 and float(Dg.min()) < good - 0.002:
+                    plan.reason = (f"least-bad: {1000 * float((Dg - need).min()):.0f} mm slack at the grasp, the best "
+                                   f"candidate so far has {1000 * self._bar:.0f}")
+                    return plan
 
         wall = self.boxes[bin_name].rim if bin_name in self.boxes else self.boxes.max_rim()   # (detected rim)
         z_carry = zc + max(g["carry_height"], self.boxes.max_rim() + H + 0.03)
@@ -1358,7 +1610,7 @@ class Planner:
         # the triangle poses lost their aligned grasp to "carry: no joint-space path" (2026-11-14). From the lift
         # on, the direction is a weak preference again (the hand turns on the way).
         w_grasp = self.kin.w_hint
-        w_carry = (g.get("face_align") or {}).get("carry_weight")
+        w_carry = getattr(det, "carry_weight", None) or (g.get("face_align") or {}).get("carry_weight")
         if w_carry is not None:
             self.kin.w_hint = min(w_grasp, float(w_carry))
         try:
@@ -1462,6 +1714,7 @@ class Planner:
         plan.ok = True
         return plan
 
+    @_part("dry-run")
     def dry_run_safety(self, arm_q, hand_q, arm, hand):
         """Clipped steps of a fresh SafetyFilter (the env's config) fed the ticks (arm, hand) after the start pose
         arm_q / hand_q, all intended: the filter sees what the policy will send (commanded(), sag feed-forward). With
