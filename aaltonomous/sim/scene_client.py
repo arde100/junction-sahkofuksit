@@ -7,7 +7,8 @@
     sc.state()["objects"]             # pelvis-frame poses + speeds
     sc.evaluate("sort_fixed")         # -> {"outcomes": [...], "score": int, "all_correct": bool}
 
-CLI: python -m aaltonomous.sim.scene_client [--host H] {ping,state,random [seed],eval [task]}
+CLI: python -m aaltonomous.sim.scene_client [--host H] {ping,state,random [seed],eval [task],info,robot [regex],
+     geometry}
 """
 from __future__ import annotations
 
@@ -58,6 +59,10 @@ class SceneClient:
     def info(self):
         return self.call(cmd="info")
 
+    def robot(self, joints=None):
+        """Live articulation values by joint name (gains, limits, pos vs PD target); joints: regex filter."""
+        return self.call(cmd="robot", joints=joints)
+
     def randomize(self, seed=None):
         """DR: sample + apply one parameter set (no-op, params None, when the sim runs without AALTO_DR)."""
         return self.call(cmd="randomize", seed=seed)
@@ -76,12 +81,18 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=None, help="default $AALTO_SCENE_PORT or 55580")
-    ap.add_argument("cmd", choices=["ping", "state", "random", "eval"])
-    ap.add_argument("arg", nargs="?")
+    ap.add_argument("cmd", choices=["ping", "state", "random", "eval", "info", "robot", "geometry"])
+    ap.add_argument("arg", nargs="?", help="random: seed; eval: task; robot: joint-name regex (e.g. hand)")
     a = ap.parse_args(argv)
     c = SceneClient(a.host, a.port)
     if a.cmd == "ping":
         r = c.ping()
+    elif a.cmd == "info":
+        r = c.info()
+    elif a.cmd == "robot":
+        r = c.robot(a.arg)
+    elif a.cmd == "geometry":
+        r = c.call(cmd="geometry")
     elif a.cmd == "state":
         r = c.state()
     elif a.cmd == "random":

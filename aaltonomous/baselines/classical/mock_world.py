@@ -14,13 +14,18 @@ The stock MockBackend returns blank images and has no objects. RenderMockBackend
     policy measures and where the hand really is) includes it; close_log has one row per hand close (t, side, grasp
     point measured / commanded, nearest object and its distance to the measured grasp point). attach_once: an object
     attaches only at the first closed tick (else also later, e.g. while a closed hand that missed is lifted).
+    sag_iters (presets: 3): the torque at the sagged pose itself (kp (cmd - meas) = tau_g(meas), as a PD arm settles;
+    the policy's feed-forward lands exactly there); 1 = at the commanded-tracking state (the older tests' numbers).
   * optional real-robot joint signatures (what autoprofile.py tells the worlds apart by; REAL_WORLD / SIM_WORLD =
     presets, make_mock_env(world="real" | "sim")): `cmd_delay` ticks of command latency, `hand_tau` (s) finger lag,
     `hand_deadband` / `arm_deadband` (rad, scalar or per joint): a joint stops that far short of its command (no-load
     error, friction; a smaller command change does not move it), `hand_bias` (14,): a constant finger offset,
     `joint_noise` (arm, hand) rad sd on the measured joints; `hand_soft_limits`: the fingers stop at the middle 90 % of
     their URDF range (the sim's soft limits).
-No physics, no contacts, no occlusion by the arms. Not a substitute for Isaac (WP3); it only exercises the
+  * other box layouts (`boxes` = box_row(front_x, yaw_deg, wall_h, gap, ...): renders, drops and outcomes use them),
+    a larger table (`counter_size`), a true head pose that differs from calibration.yaml (`head_T`), and the arms'
+    sphere model in the head image (`render_arms`; else the arms are invisible).
+No physics, no contacts. Not a substitute for Isaac (WP3); it only exercises the
 perception -> IK -> trajectory -> AaltoEnv/SafetyFilter path. AaltoEnv itself is used unchanged:
 
     env = make_mock_env(seed=0)       # AaltoEnv(backend="mock") with its backend swapped for this one
@@ -50,8 +55,21 @@ REAL_SAG_GAIN = (-1 / 80, -1 / 80, -1 / 80, -1 / 80, -1 / 40, -1 / 40, -1 / 40)
 REAL_HAND_DEADBAND = (0.0, 0.033, 0.015, 0.029, 0.019, 0.027, 0.020, 0.036, 0.028, 0.011, 0.015, 0.009, 0.015, 0.013)
 REAL_HAND_BIAS = (0.075,) + (0.0,) * 13
 REAL_WORLD = dict(sag_gain=REAL_SAG_GAIN, arm_deadband=0.003, hand_deadband=REAL_HAND_DEADBAND,
-                  hand_bias=REAL_HAND_BIAS, cmd_delay=2, hand_tau=0.08, joint_noise=(0.0005, 0.002))
-SIM_WORLD = dict(sag_gain=True, hand_soft_limits=True)
+                  hand_bias=REAL_HAND_BIAS, cmd_delay=2, hand_tau=0.08, joint_noise=(0.0005, 0.002), sag_iters=3)
+
+
+def held_gap_for(cfg):
+    """How far short of the commanded closed posture (rad on the joint with the largest travel) the mock's fingers
+    stop on a held object: a property of the grasp, not of the world. The robot profile's cage (verify.signal
+    finger_shortfall) closes 0.3-0.6 rad past the object: held objects read 0.22-0.60 on that signal in the grasp
+    lab (real-like sim variants, finger kp 1.5), an empty close <= 0.09; 0.35 gives 0.14-0.32 on the four finger
+    joints. The sim profile's pinch: 0.036 (with that value every object held in the cage read "empty" against
+    verify.empty_below 0.12)."""
+    return 0.35 if ((cfg or {}).get("verify") or {}).get("signal") == "finger_shortfall" else 0.036
+SIM_WORLD = dict(sag_gain=True, hand_soft_limits=True, sag_iters=3)
+# Object colours as the real head camera sees them (data drop 2, OpenCV H): internal red = orange (H ~12), yellow
+# (H ~28), blue = the "purple" objects (H 111, blue-violet). For RenderMockBackend(colors=...).
+REAL_COLORS = {"red": (240, 110, 20), "yellow": (210, 200, 40), "blue": (60, 102, 200)}
 
 
 def _yaw_R(yaw):
@@ -59,16 +77,50 @@ def _yaw_R(yaw):
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])
 
 
+def box_row(front_x=0.40, yaw_deg=0.0, wall_h=0.06, gap=0.05, size=0.21, y0=0.0, wall_t=0.003, floor_t=0.003,
+            rgb=(230, 110, 30), names=("left", "center", "right")):
+    """Three boxes in a row (Renderer / RenderMockBackend `boxes`): the centre box's near wall midpoint at pelvis
+    (front_x, y0), the row (and every box) yawed by yaw_deg, `gap` between neighbours. Defaults = scene.yaml."""
+    a = np.radians(yaw_deg)
+    u, v = np.array([np.cos(a), np.sin(a)]), np.array([-np.sin(a), np.cos(a)])
+    c0 = np.array([front_x, y0]) + size / 2 * u
+    out = []
+    for k, n in zip((1, 0, -1), ("left", "center", "right")):
+        if n in names:
+            out.append({"name": n, "c": c0 + k * (size + gap) * v, "yaw": a, "size": size, "wall_h": wall_h,
+                        "wall_t": wall_t, "floor_t": floor_t, "rgb": rgb})
+    return out
+
+
+def _rest_height(sc, c):
+    """Centre height above the counter of a layout entry at rest (lying: messy.lying_dims)."""
+    if c.get("lying"):
+        from aaltonomous.sim.aalto_task.messy import spawn_height
+        return spawn_height(sc, c)
+    return sc.object_height(c.get("shape")) / 2
+
+
+def _box_local(b, xy):
+    d = np.asarray(xy, float)[..., :2] - b["c"]
+    c, s = np.cos(b["yaw"]), np.sin(b["yaw"])
+    return np.stack([c * d[..., 0] + s * d[..., 1], -s * d[..., 0] + c * d[..., 1]], -1)
+
+
 class Renderer:
-    def __init__(self, scene: Scene, cal: Calibration, cam="head"):
+    def __init__(self, scene: Scene, cal: Calibration, cam="head", colors=None, boxes=None, T=None, counter_size=None):
+        """colors: {internal colour: rgb} rendered instead of scene.yaml's (e.g. REAL_COLORS; names stay internal).
+        boxes: box_row() dicts instead of scene.yaml's bins (any pose / yaw / wall height); T: the TRUE camera pose
+        (calibration.yaml's if None; perception keeps using calibration.yaml: a camera error); counter_size: mat-axes
+        size of the table top (scene.yaml's if None; the robot's table is larger than the mat)."""
         self.scene, self.cal, self.cam = scene, cal, cam
         c = cal.cams[cam]
-        T = cal._T(cam)
+        T = cal._T(cam) if T is None else np.asarray(T, float)
+        self.boxes, self.counter_size = boxes, counter_size
         self.K, self.R, self.o = c.K, T[:3, :3], T[:3, 3]
         u, v = np.meshgrid(np.arange(W) + 0.0, np.arange(H) + 0.0)
         ray_opt = np.stack([(u - c.K[0, 2]) / c.K[0, 0], (v - c.K[1, 2]) / c.K[1, 1], np.ones_like(u)], -1)
         self.rays = ray_opt @ self.R.T             # pelvis-frame directions; ray param t == optical depth (m)
-        self.colors = {k: np.asarray(v, float) for k, v in scene.colors.items()}
+        self.colors = {k: np.asarray(v, float) for k, v in {**scene.colors, **(colors or {})}.items()}
         self._bg = self._background()
 
     # ---------------------------------------------------------------- primitives
@@ -89,12 +141,16 @@ class Renderer:
         p = self.o + t[..., None] * self.rays
         pm = sc.pelvis_to_mat(np.where(np.isfinite(p), p, 0.0))
         mat = np.asarray(sc.cfg["counter"]["mat_size"], float)
-        size = np.asarray(sc.cfg["counter"]["counter_size"], float)
+        size = np.asarray(sc.cfg["counter"]["counter_size"] if self.counter_size is None else self.counter_size, float)
         lo, hi = mat / 2 - size / 2, mat / 2 + size / 2
         on = np.isfinite(t) & np.all((pm[..., :2] >= lo) & (pm[..., :2] <= hi), axis=-1) & (t < zb)
         rgb[on] = MAT_RGB
         rgb[on] += ((np.floor(pm[on, 0] / 0.05) + np.floor(pm[on, 1] / 0.05)) % 2)[:, None] * 12.0  # grid
         zb[on] = t[on]
+        if self.boxes is not None:
+            for bx in self.boxes:
+                self._draw_box(rgb, zb, bx)
+            return rgb, zb
         b = sc.cfg["bins"]
         ox, oy = np.asarray(b["outer_size"], float) / 2
         wt, wh, ft = b["wall_thickness"], b["wall_height"], b["floor_thickness"]
@@ -108,9 +164,37 @@ class Renderer:
                 self._box(rgb, zb, c + np.asarray(off), np.eye(3), np.asarray(half), col)
         return rgb, zb
 
+    def _draw_box(self, rgb, zb, b):
+        """A box_row() box: floor + 4 walls (outer side `size`, walls wall_t thick, wall_h high) at its pose."""
+        a, wt, wh, ft = b["size"] / 2, b["wall_t"], b["wall_h"], b["floor_t"]
+        R = _yaw_R(b["yaw"])
+        base = np.r_[b["c"], self.scene.counter_z]
+        parts = [((0, 0, ft / 2), (a, a, ft / 2)), ((-a + wt / 2, 0, wh / 2), (wt / 2, a, wh / 2)),
+                 ((a - wt / 2, 0, wh / 2), (wt / 2, a, wh / 2)), ((0, -a + wt / 2, wh / 2), (a, wt / 2, wh / 2)),
+                 ((0, a - wt / 2, wh / 2), (a, wt / 2, wh / 2))]
+        for off, half in parts:
+            self._box(rgb, zb, base + R @ np.asarray(off, float), R, np.asarray(half, float),
+                      np.asarray(b.get("rgb", (230, 110, 30)), float))
+
+    def _sphere(self, rgb, zb, center, r, col):
+        win = self._pixels(np.asarray(center, float), np.eye(3), np.full(3, r))
+        if win is None:
+            return
+        d = self.rays[win]
+        o = self.o - center
+        bq = (d * o).sum(-1)
+        disc = bq * bq - (d * d).sum(-1) * (o @ o - r * r)
+        with np.errstate(invalid="ignore"):
+            t = (-bq - np.sqrt(disc)) / (d * d).sum(-1)
+        hit = (disc >= 0) & (t > 0)
+        self._write(rgb, zb, win, hit, np.where(hit, t, np.inf), np.full(hit.shape, 0.5), col)
+
     def _pixels(self, center, R, half):
         corners = center + (np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]) * half) @ R.T
-        uvz = self.cal.project(self.cam, corners)
+        p = (corners - self.o) @ self.R
+        with np.errstate(divide="ignore", invalid="ignore"):
+            uvz = np.stack([self.K[0, 0] * p[:, 0] / p[:, 2] + self.K[0, 2],
+                            self.K[1, 1] * p[:, 1] / p[:, 2] + self.K[1, 2], p[:, 2]], -1)
         if np.any(uvz[:, 2] <= 0.01):
             return None
         u0, v0 = np.floor(uvz[:, :2].min(0)).astype(int) - 1
@@ -180,6 +264,53 @@ class Renderer:
         nz = np.abs(n[t_in.argmax(-1), 2])
         self._write(rgb, zb, win, hit, tmin, nz, col)
 
+    def _convex(self, rgb, zb, center, n, off, r, col):
+        """Convex polyhedron {p: n . (p - center) <= off} (n (k, 3) unit outward normals) within radius r."""
+        win = self._pixels(center, np.eye(3), np.full(3, r))
+        if win is None:
+            return
+        d = self.rays[win]
+        o = self.o - center
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dn = d @ n.T
+            t = (off - o @ n.T) / dn
+        t_in = np.where(dn < 0, t, -np.inf)
+        t_out = np.where(dn > 0, t, np.inf)
+        tmin, tmax = t_in.max(-1), t_out.min(-1)
+        hit = (tmin <= tmax) & (tmin > 0) & ~np.all(o @ n.T <= off)
+        self._write(rgb, zb, win, hit, tmin, np.abs(n[t_in.argmax(-1), 2]), col)
+
+    def _lying(self, rgb, zb, ob, col):
+        """A prism / cylinder lying on a rectangular side (messy.py): its axis horizontal along ob["ridge_yaw"]
+        (pelvis), ob["pos"] = its centroid. Prism: triangle of altitude `size` across, `height` long, ridge on top."""
+        s, L = ob["size"], ob.get("height", ob["size"])
+        r = float(ob.get("ridge_yaw", 0.0))
+        a, nn = np.array([np.cos(r), np.sin(r), 0.0]), np.array([-np.sin(r), np.cos(r), 0.0])
+        c = np.asarray(ob["pos"], float)
+        if ob.get("shape") == "cylinder":                      # rays in the cylinder's frame (axis = local z)
+            R = np.c_[nn, [0.0, 0.0, 1.0], a]
+            win = self._pixels(c, R, np.array([s / 2, s / 2, L / 2]))
+            if win is None:
+                return
+            d, o = self.rays[win] @ R, (self.o - c) @ R
+            A = d[..., 0] ** 2 + d[..., 1] ** 2
+            B = 2 * (o[0] * d[..., 0] + o[1] * d[..., 1])
+            disc = B * B - 4 * A * (o[0] ** 2 + o[1] ** 2 - s * s / 4)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ts = (-B - np.sqrt(disc)) / (2 * A)
+                tc = (np.sign(o[2]) * L / 2 - o[2]) / d[..., 2]
+            side = (disc >= 0) & (ts > 0) & (np.abs(o[2] + ts * d[..., 2]) <= L / 2)
+            pc = o + tc[..., None] * d
+            cap = (tc > 0) & (pc[..., 0] ** 2 + pc[..., 1] ** 2 <= s * s / 4)
+            t = np.where(cap & (~side | (tc < ts)), tc, np.where(side, ts, np.inf))
+            nzs = np.abs((o + np.where(np.isfinite(t), t, 0)[..., None] * d)[..., 1]) / (s / 2)
+            self._write(rgb, zb, win, np.isfinite(t), t, np.where(t == tc, 0.0, nzs), col)
+            return
+        k = np.sqrt(3) / 2
+        n = np.array([a, -a, [0.0, 0.0, -1.0], k * nn + [0, 0, 0.5], -k * nn + [0, 0, 0.5]])
+        off = np.array([L / 2, L / 2, s / 3, s / 3, s / 3])
+        self._convex(rgb, zb, c, n, off, float(np.hypot(L / 2, s)), col)
+
     @staticmethod
     def _write(rgb, zb, win, hit, t, nz, col):
         z = zb[win]
@@ -193,13 +324,20 @@ class Renderer:
         rgb[win], zb[win] = sub, z
 
     # ---------------------------------------------------------------- frame
-    def render(self, objects, rng=None, depth_noise_mm=0.0, hole_frac=0.0):
+    def render(self, objects, rng=None, depth_noise_mm=0.0, hole_frac=0.0, spheres=None):
+        """spheres: [(centres (n, 3), radii (n,))] drawn dark (the arms' sphere model: what the head camera sees of
+        the forearms and hands)."""
         rgb, zb = self._bg[0].copy(), self._bg[1].copy()
+        for C, Rr in spheres or ():
+            for c, r in zip(np.asarray(C, float).reshape(-1, 3), np.asarray(Rr, float).reshape(-1)):
+                self._sphere(rgb, zb, c, float(r), np.array([35.0, 35.0, 40.0]))
         from aaltonomous.scene.scene import shape_polygon
         for ob in objects:  # yaw = about pelvis z, scene.shape_polygon convention (triangle apex at yaw + 90 deg)
             col = self.colors[ob["color"]] if isinstance(ob["color"], str) else np.asarray(ob["color"], float)
             s, h = ob["size"], ob.get("height", ob["size"])
-            if ob.get("shape", "cube") in ("cylinder", "circle"):
+            if ob.get("lying") and ob.get("shape") in ("triangle", "cylinder"):
+                self._lying(rgb, zb, ob, col)
+            elif ob.get("shape", "cube") in ("cylinder", "circle"):
                 self._cylinder(rgb, zb, ob["pos"], s / 2, h / 2, col)
             elif ob.get("shape") == "triangle":  # equilateral prism, altitude = size, centroid at pos
                 self._prism(rgb, zb, np.asarray(ob["pos"], float), shape_polygon("triangle", s / 3, ob.get("yaw", 0.0)),
@@ -222,8 +360,21 @@ class RenderMockBackend(MockBackend):
     def __init__(self, scene, cal, kin, postures, attach_radius=0.04, depth_noise_mm=1.0, hole_frac=0.02, seed=0,
                  held_gap=0.036, fail_grasps=(), fail_prob=0.0, miss_push=(0.02, 0.0), slip_grasps=(), slip_after_s=1.6,
                  stack_radius=0.0, sag_gain=None, arm_offset=None, attach_once=False, cmd_delay=0, hand_tau=None,
-                 hand_deadband=None, arm_deadband=None, hand_bias=None, joint_noise=None, hand_soft_limits=False, **kw):
+                 hand_deadband=None, arm_deadband=None, hand_bias=None, joint_noise=None, hand_soft_limits=False,
+                 sag_iters=1, colors=None, boxes=None, counter_size=None, head_T=None, render_arms=False,
+                 ballistic=False, messy=None, **kw):
+        """colors: rendered object colours (names stay internal). boxes / counter_size / head_T: the true boxes
+        (box_row(); drops and outcomes use them), table and camera pose (see Renderer); render_arms: the head image
+        shows the arms' sphere model at the measured pose. ballistic: a released object keeps the grasp point's
+        velocity (last tick, measured arm) and flies to the counter level before it drops (point mass, no drag, no
+        bounce); with `boxes`, one that comes down on a wall stays on its rim. messy: a variant's `layout:` section
+        (lying_prism_prob, cluster_prob, ...): layouts placed by sim/aalto_task/messy.py (lying prisms, touching
+        clusters)."""
         super().__init__(**kw)
+        self.ballistic, self._g_last = bool(ballistic), {}
+        self.boxes, self.counter_size, self.render_arms = boxes, counter_size, bool(render_arms)
+        self.messy, self.layout_placed = messy, None
+        self.sag_iters = max(1, int(sag_iters))
 
         def vec(v):
             return None if v is None else np.broadcast_to(np.asarray(v, float), (14,)).copy()
@@ -247,7 +398,7 @@ class RenderMockBackend(MockBackend):
         self.attach_once = bool(attach_once)                  # attach only at the first closed tick (no later
                                                               # attach while a closed hand moves, e.g. lifts)
         self.scene, self.kin, self.post = scene, kin, postures
-        self.renderer = Renderer(scene, cal)
+        self.renderer = Renderer(scene, cal, colors=colors, boxes=boxes, T=head_T, counter_size=counter_size)
         self.attach_radius = attach_radius
         self.depth_noise_mm, self.hole_frac = depth_noise_mm, hole_frac
         self.rng = np.random.default_rng(seed)
@@ -266,21 +417,31 @@ class RenderMockBackend(MockBackend):
         self.close_log, self._closing = [], {"left": False, "right": False}
 
     def _tracking(self, q):
-        """Static joint error at arm state q (14,): sag_gain * gravity torque (+ arm_offset)."""
+        """Static joint error at arm state q (14,): sag_gain * gravity torque (+ arm_offset). sag_iters > 1: the torque
+        at the sagged pose itself (fixed point; a PD arm settles where kp (cmd - meas) = tau_g(meas)); 1 = at q."""
         off = np.zeros(14) if self.arm_offset is None else self.arm_offset.copy()
         if self.sag_gain is not None:
             k = self.kin
             x = k.q0.copy()
-            x[k.arm_iq], x[k.hand_iq] = q, self.hand_q
-            off += self.sag_gain * k.pin.computeGeneralizedGravity(k.model, k.data, x)[k.arm_iv]
+            x[k.hand_iq] = self.hand_q
+            s = np.zeros(14)
+            for i in range(self.sag_iters):
+                x[k.arm_iq] = q if i == 0 else q + off + s
+                s = self.sag_gain * k.pin.computeGeneralizedGravity(k.model, k.data, x)[k.arm_iv]
+            off += s
         return off
 
     def reset_scene(self, layout, instruction):
         super().reset_scene(layout, instruction)
         sc = self.scene
-        self.objects = [{"color": c["color"], "shape": c.get("shape", "cube"), "yaw": c.get("yaw", 0.0), "size": sc.size,
-                         "height": sc.object_height(c.get("shape")),
-                         "pos": sc.mat_to_pelvis(sc.cube_spawn_mat(c))} for c in layout]
+        if self.messy:                          # lying prisms / touching clusters as the sim places them (messy.py)
+            from aaltonomous.sim.aalto_task.messy import messy_layout
+            layout = messy_layout({"layout": self.messy}, sc, layout)
+        self.layout_placed = layout
+        self.objects = [{"color": c["color"], "shape": c.get("shape", "cube"), "yaw": c.get("yaw", 0.0),
+                         "size": sc.size, "height": sc.object_height(c.get("shape")), "lying": bool(c.get("lying")),
+                         "ridge_yaw": c.get("ridge_yaw", 0.0),
+                         "pos": sc.mat_to_pelvis([c["x"], c["y"], _rest_height(sc, c)])} for c in layout]
         self.held = {"left": None, "right": None}
         self._cache = None
         self._reset_grasps()
@@ -370,8 +531,11 @@ class RenderMockBackend(MockBackend):
                 i, off, t_slip = h
                 self.objects[i]["pos"] = g + off
                 if f < 0.3 or (t_slip is not None and self.t >= t_slip):
+                    if self.ballistic and side in self._g_last:
+                        self._fly(self.objects[i], (g - self._g_last[side]) / dt)
                     self._drop(self.objects[i])
                     self.held[side] = None
+            self._g_last[side] = g
             if self.held[side] is not None:  # fingers on the object stop held_gap short of the closed posture
                 sl = slice(0, 7) if side == "left" else slice(7, 14)
                 d = self.post["closed"][sl] - self.post["open"][sl]
@@ -379,9 +543,46 @@ class RenderMockBackend(MockBackend):
                 if self._closure(side) > f_stop:
                     self.hand_q[sl] = self.hand_q[sl] - (self._closure(side) - f_stop) * d
 
+    def _on_counter(self, pm):
+        c = self.scene.cfg["counter"]
+        mat = np.asarray(c["mat_size"], float)
+        size = np.asarray(c["counter_size"] if self.counter_size is None else self.counter_size, float)
+        return bool(np.all(pm[:2] >= mat / 2 - size / 2) and np.all(pm[:2] <= mat / 2 + size / 2)
+                    and pm[2] > -float(self.scene.cfg["success"]["off_counter_drop"]))
+
+    def _true_bin(self, pos):
+        """Name of the true box (self.boxes) whose inner footprint holds pelvis xy pos (below its rim), else None."""
+        z = pos[2] - self.scene.counter_z
+        for b in self.boxes:
+            L = np.abs(_box_local(b, pos))
+            if np.all(L <= b["size"] / 2 - b["wall_t"]) and z <= b["wall_h"]:
+                return b["name"]
+        return None
+
+    def _fly(self, ob, v):
+        """ballistic: the object leaves with velocity v (3,) and flies until its centre is at counter level + half
+        its height (then _drop puts it where it came down)."""
+        dz = ob["pos"][2] - (self.scene.counter_z + ob["height"] / 2)
+        if dz > 0:
+            T = (v[2] + np.sqrt(v[2] ** 2 + 2 * 9.81 * dz)) / 9.81
+            ob["pos"] = np.r_[ob["pos"][:2] + np.asarray(v, float)[:2] * T, ob["pos"][2]]
+
     def _drop(self, ob):
         sc = self.scene
         pm = sc.pelvis_to_mat(ob["pos"])
+        ob["lying"] = False                     # (a released object lands upright: kinematic mock)
+        if self.boxes is not None:              # the true boxes (any pose): inner footprint -> its floor
+            for b in self.boxes:
+                if np.all(np.abs(_box_local(b, ob["pos"])) <= b["size"] / 2 - b["wall_t"]):
+                    ob["pos"] = np.r_[ob["pos"][:2], sc.counter_z + b["floor_t"] + ob["height"] / 2]
+                    return
+            for b in self.boxes if self.ballistic else ():   # came down on a wall: stays on the rim
+                if np.all(np.abs(_box_local(b, ob["pos"])) <= b["size"] / 2):
+                    ob["pos"] = np.r_[ob["pos"][:2], sc.counter_z + b["wall_h"] + ob["height"] / 2]
+                    return
+            z = ob["height"] / 2 if self._on_counter(np.r_[pm[:2], 0.0]) else -1.0
+            ob["pos"] = sc.mat_to_pelvis([pm[0], pm[1], z])
+            return
         for name in sc.bin_names:
             lo, hi = sc.bin_inner_box(name)
             if np.all(pm[:2] >= lo[:2]) and np.all(pm[:2] <= hi[:2]):
@@ -398,14 +599,27 @@ class RenderMockBackend(MockBackend):
 
     def images(self):
         key = tuple(np.round(np.concatenate([o["pos"] for o in self.objects]), 4)) if self.objects else ()
+        sph = None
+        if self.render_arms:
+            sph = [self.kin.hand_spheres(s, self.arm_q, self.hand_q) for s in ("left", "right")]
+            sph = [(c[0], r) for c, r in sph]
+            key = key + tuple(np.round(np.r_[self.arm_q, self.hand_q], 3))
         if self._cache is None or self._cache[0] != key:
-            rgb, depth = self.renderer.render(self.objects, self.rng, self.depth_noise_mm, self.hole_frac)
+            rgb, depth = self.renderer.render(self.objects, self.rng, self.depth_noise_mm, self.hole_frac, spheres=sph)
             self._cache = (key, rgb, depth)
         out = super().images()
         out["head_rgb"], out["head_depth"] = self._cache[1].copy(), self._cache[2].copy()
         return out
 
     def outcomes(self, mapping):
+        if self.boxes is not None:              # the true boxes: centre in an inner footprint below the rim
+            from aaltonomous.scene.scene import resolve_bin
+            out = []
+            for o in self.objects:
+                b = self._true_bin(o["pos"])
+                out.append("off" if not self._on_counter(self.scene.pelvis_to_mat(o["pos"])) else "counter" if b is None
+                           else "correct" if resolve_bin(mapping, o["color"]) == b else "wrong")
+            return out
         return [self.scene.classify_cube(o["pos"], 0.0, o["color"], mapping) for o in self.objects]  # colour rule (rung 1)
 
 
@@ -420,6 +634,7 @@ def make_mock_env(scene_path=None, seed=0, cfg=None, realtime=False, world=None,
     if world is not None:
         preset = {"sim": SIM_WORLD, "real": REAL_WORLD}[world]
         backend_kw = {"arm_q0": load_config(profile="sim")["home_arm_q"], **preset, **backend_kw}
+    backend_kw.setdefault("held_gap", held_gap_for(cfg))      # (explicit held_gap wins)
     env = AaltoEnv(backend="mock", task="sort_fixed", seed=seed, realtime=realtime)
     if scene_path is not None:
         env.scene = Scene.load(scene_path)

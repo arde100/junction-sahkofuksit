@@ -20,6 +20,19 @@ every trial ends without safety abort / watchdog stop / crash / lost connection,
 command rate >= --gate-min-hz (sim time when the sim publishes its clock) AND policy_hz_rt >= --gate-min-hz (what the
 policy's own wall latency allows, so a slow policy can't pass just because the sim runs slower than real time). Exit code 0 = gate passed, 2 = failed.
 
+Sim variant (AALTO_VARIANT on the sim, aalto_task/variant.py): its `color_words` (e.g. red -> orange, blue ->
+purple) rename the colour words of the instruction handed to the policy (--color-words auto, the default; or an
+explicit 'red=orange,blue=purple'; 'off'). Objects, layout, mapping and scoring keep the internal colours: the
+instruction "purple ... right bin" is scored as internal blue -> right, i.e. the same objects to the same bins.
+--policy oracle is a privileged reference: it is handed the instruction back in internal words (so its reader and
+its colour-named privileged detections agree) and it plans with the variant's scene (overlay, boxes, table), if
+any. Layouts are sampled with the sim's scene too (variant.scene), so a variant's layout / object overlay holds.
+
+--instructions SET (sort_language; instruction_sets.py): shape / colour + shape / mixed / partial / negation /
+unseen-paraphrase instructions drawn per trial seed with their TRUE mapping (scored as is; objects without a bin must
+stay: 0 left, -1 in any box), --distractor = some object's colour or shape is never mentioned. max_score then = +2 per
+object that has a bin. Default (no option): tasks.make_instruction, output unchanged.
+
 Second sim instance: AALTO_DDS_DOMAIN / AALTO_SCENE_PORT / AALTO_RGBD_PORT / AALTO_CAM_PORT_BASE must match the
 values that sim was started with (run_sim.sh); defaults = the standard sim (domain 1, 55580, 55560, 55555).
 """
@@ -66,12 +79,14 @@ def apply_instance_env():
 class LocalClient:
     """In-process policy with the runner's PolicyClient API (reset / act_async / close)."""
 
-    def __init__(self, policy, name="oracle"):
+    def __init__(self, policy, name="oracle", words=None):
         self.policy, self.pool = policy, ThreadPoolExecutor(1)
         self.metadata = {"type": "metadata", "name": name, "local": True}
+        self.words = words or {}           # told word -> internal colour (variant colour words, undone)
 
     def reset(self, task, instruction, seed):
-        self.policy.reset({"instruction": instruction})
+        from aaltonomous.sim.aalto_task.variant import rename
+        self.policy.reset({"instruction": rename(instruction, self.words)})
 
     def act(self, obs):
         return self.policy.act(obs)
@@ -81,6 +96,33 @@ class LocalClient:
 
     def close(self):
         self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+def color_words(arg, sim_info):
+    """--color-words: 'auto' = the sim variant's color_words (none without a variant), 'off', or 'red=orange,...'.
+    Returns {internal colour: told word}, checked (internal names, distinct words)."""
+    from aaltonomous.interface.tasks import COLORS
+    from aaltonomous.sim.aalto_task import variant
+    if arg in (None, "auto"):
+        m = dict(((sim_info or {}).get("variant") or {}).get("color_words") or {})
+    else:
+        m = variant.parse_words(arg)
+    return variant.check_words(m, COLORS)
+
+
+def rename_instructions(env, words):
+    """Every env.reset() hands out the instruction with the colour words renamed (env.instruction and obs, so the
+    policy only ever sees the told words); env.mapping stays internal (scoring). No-op for {}."""
+    if not words:
+        return
+    from aaltonomous.sim.aalto_task.variant import rename
+    orig = env.reset
+
+    def reset():
+        obs = orig()
+        env.instruction = obs["instruction"] = rename(env.instruction, words)
+        return obs
+    env.reset = reset
 
 
 def home_arms(env, sc, vmax=0.6, hold_s=0.5):
@@ -152,24 +194,48 @@ def evaluate(a):
     except RuntimeError:                     # older sim without `info`: no DR
         sim_info = {"dr": None}
     sim_info.pop("ok", None)
-    variant = a.variant or (sim_info.get("dr") or {}).get("name") or "nominal"
+    words = color_words(a.color_words, sim_info)                   # {} = instruction as tasks.py makes it
+    sim_variant = (sim_info.get("variant") or {}).get("name")       # AALTO_VARIANT of the sim (None = organisers')
+    variant = a.variant or "+".join(x for x in (sim_variant, (sim_info.get("dr") or {}).get("name")) if x) or "nominal"
     stamp = time.strftime("%Y%m%d_%H%M%S")
     name = a.team or ("oracle" if a.policy == "oracle" else "policy")
-    out_dir = Path(a.out) / f"{name}_{a.task}_{variant}_{stamp}"
+    task = a.task + (f"-{a.instructions}{'+dis' if a.distractor else ''}" if getattr(a, "instructions", None) else "")
+    out_dir = Path(a.out) / f"{name}_{task}_{variant}_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = AaltoEnv(backend="sim", task=a.task, seed=a.seed, time_limit=a.time_limit, realtime=True,
                    img_server_ip=a.host, head_rgbd=not a.no_head_rgbd,
                    head_rgbd_port=int(os.environ.get("AALTO_RGBD_PORT", "55560")), cameras=not a.no_cameras)
+    IS = None
+    if getattr(a, "instructions", None):   # richer instructions + their true mapping (instruction_sets.py); before
+        from aaltonomous.sim import instruction_sets as IS   # the renaming, so their colour words are renamed too
+        IS.install(env, a.instructions, a.distractor)
+    rename_instructions(env, words)
+    if sim_info.get("variant"):
+        # sample layouts with the SIM's scene (variant overlay: layout region / n_cubes / spacing, object size), not
+        # AaltoEnv's scene.yaml; identical to it when the variant has no scene overlay
+        from aaltonomous.sim.aalto_task import messy, variant as V
+        env.scene = V.scene(sim_info["variant"])
+        # variant `layout:` (lying prisms, clusters): the same deterministic transform the sim would apply, done here
+        # so env.layout (the trial log) is what the sim places; the sim leaves a layout with `lying` as it is
+        messy.install(env, sim_info["variant"])
+    if words:
+        print(f"[evaluate] colour words told to the policy: {words} (scoring on the internal colours)")
     cm, client = None, None
     trials = []
     stop = threading.Event()
     try:
         if a.policy == "oracle":
+            from aaltonomous.sim.aalto_task import variant as V
             from aaltonomous.sim.oracle import OraclePolicy
+            kw = {}
+            sv = sim_info.get("variant") or {}
+            if sv.get("scene") or sv.get("boxes") is not None or (sv.get("table") or {}).get("x") is not None \
+                    or (sv.get("table") or {}).get("y") is not None:
+                kw["scene"] = V.scene(sv)   # the sim's geometry (bins, counter): privileged, like the object poses
             pol = OraclePolicy(SceneClient(a.host), safety=env.filter.cfg, time_limit=a.time_limit,
-                               privileged_mapping=lambda: env.mapping, log=(print if a.verbose else None))
-            client = LocalClient(pol)
+                               privileged_mapping=lambda: env.mapping, log=(print if a.verbose else None), **kw)
+            client = LocalClient(pol, words=V.inverse(words))
         else:
             url = a.policy
             if a.container:
@@ -182,6 +248,7 @@ def evaluate(a):
             seed = a.seed + i
             home_err = home_arms(env, sc)
             env.rng = np.random.default_rng(seed)
+            env.instruction_seed = seed          # (instruction_sets.install draws from it)
             dr = None
             if sim_info.get("dr"):
                 dr = sc.call(cmd="randomize", seed=seed).get("params")
@@ -209,6 +276,14 @@ def evaluate(a):
                      "all_correct": ev["all_correct"], "settle_s": round(settled, 2),
                      "episode_wall_s": round(time.monotonic() - t0, 1), "home_err": round(home_err, 3), "final_objects": final,
                      "dr_params": dr}
+            if words:   # what the policy was told; "mapping" (scored) stays in internal colours
+                from aaltonomous.sim.aalto_task.variant import told_mapping
+                trial["color_words"], trial["mapping_told"] = words, told_mapping(env.mapping, words)
+            if IS is not None:  # set, texts, true mapping (tuple keys as 'colour/shape'), who had to stay; best score
+                trial.update(IS.trial_fields(env.instruction_draw, sc.state()["objects"], ev["outcomes"], words))
+                trial["max_score"] = per_ok * (len(outc) - trial["n_must_stay"])   # = +2 per object that has a bin
+                print(f"  instruction [{trial['instruction_set']}/{trial['instruction_kind']}] {env.instruction!r}  "
+                      f"had to stay {trial['n_must_stay']}, stayed {trial['n_stayed']}", flush=True)
             if a.policy == "oracle":
                 trial["mapping_source"] = pol.mapping_source
                 trial["oracle_events"] = pol.events[-300:]   # the policy logs looks + verification now: 40 no longer covers an episode
@@ -232,6 +307,10 @@ def evaluate(a):
             cm.__exit__()
 
     res = summarize(trials, a, variant, sim_info)
+    if sim_variant or words:
+        res.update(sim_variant=sim_info.get("variant"), color_words=words)
+    if IS is not None and trials:
+        res.update(IS.summarize(trials, a.instructions, a.distractor))
     (out_dir / "eval.json").write_text(json.dumps({"summary": res, "trials": trials}, indent=1, default=_js))
     print_table(res)
     print(f"-> {out_dir / 'eval.json'}")
@@ -293,6 +372,9 @@ def print_table(r):
             ("min policy real-time rate", f"{r.get('policy_hz_rt_min')} Hz"),
             ("sim real-time factor", f"mean {r.get('rtf_mean')}  min {r.get('rtf_min')}"),
             ("SIM GATE", "PASS" if r["gate"]["passed"] else f"FAIL (trials {r['gate']['failed_trials']})")]
+    if r.get("instructions"):             # --instructions: wrong / left / off and who had to stay, per set
+        from aaltonomous.sim.instruction_sets import table_rows
+        rows[-1:-1] = table_rows(r)
     w = max(len(k) for k, _ in rows)
     print("\n" + "\n".join(f"  {k:<{w}}  {v}" for k, v in rows))
 
@@ -313,7 +395,14 @@ def main(argv=None):
     ap.add_argument("--time-limit", type=float, default=120.0)
     ap.add_argument("--settle", type=float, default=3.0, help="max s to wait for objects at rest before scoring")
     ap.add_argument("--host", default="127.0.0.1", help="sim host (scene service, cameras)")
-    ap.add_argument("--variant", default=None, help="label; default = the sim's DR config name")
+    ap.add_argument("--variant", default=None, help="label; default = the sim's AALTO_VARIANT + DR config names")
+    ap.add_argument("--color-words", default="auto", help="colour words told to the policy: auto (the sim "
+                    "variant's color_words), off, or e.g. red=orange,blue=purple (scoring stays internal)")
+    ap.add_argument("--instructions", default=None, metavar="SET", help="sort_language only: instructions from "
+                    "aaltonomous/sim/instruction_sets.py (shape, both, mixed, partial, negation, unseen, all) scored "
+                    "with their true mapping; default = tasks.make_instruction (the 8 training templates)")
+    ap.add_argument("--distractor", action="store_true", help="with --instructions: no rest clause, and some object "
+                    "on the table has a colour or shape the text never mentions (it must stay)")
     ap.add_argument("--out", default="runs/eval")
     ap.add_argument("--gate-max-clips", type=int, default=0)
     ap.add_argument("--gate-min-hz", type=float, default=27.0)
@@ -321,6 +410,11 @@ def main(argv=None):
     ap.add_argument("--no-cameras", action="store_true", help="no teleimager (wrist cams blank); oracle runs")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
+    if a.instructions or a.distractor:
+        from aaltonomous.sim.instruction_sets import CHOICES
+        if a.task != "sort_language" or a.instructions not in CHOICES or (a.distractor and a.instructions == "unseen"):
+            ap.error(f"--instructions {{{','.join(CHOICES)}}} needs --task sort_language; --distractor needs "
+                     f"--instructions (not unseen)")
     logging.basicConfig(level=logging.WARNING)
     r = evaluate(a)
     return 0 if r.get("gate", {}).get("passed") else 2

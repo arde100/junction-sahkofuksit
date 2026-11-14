@@ -107,6 +107,21 @@ class ArmKinematics:
                 if n.endswith(f"_{key}_joint"):
                     m[i] = float(v)
         lo, hi = self.spec.arm_lower + m, self.spec.arm_upper - m
+        # ik.joint_range {joint: [lo, hi]} (rad, LEFT-arm convention; the right arm's range is mirrored by ARM_MIRROR:
+        # [-hi, -lo] for the roll / yaw joints): where the planner may put a joint at all (e.g. what the real arm was
+        # seen to do), intersected with the limit margins above. Everything that plans (IK, Cartesian / joint-space
+        # moves between IK poses, the correction) stays inside self.lo / self.hi.
+        for key, v in (cfg["ik"].get("joint_range") or {}).items():
+            a, b = (float(x) for x in v)
+            idx = [i for i, n in enumerate(self.spec.arm_names) if n.endswith(f"_{key}_joint")]
+            if not idx or a >= b:
+                raise ValueError(f"ik.joint_range.{key}: {v} (unknown joint or empty range)")
+            for i in idx:
+                r = (a, b) if i < 7 or ARM_MIRROR[i % 7] > 0 else (-b, -a)
+                lo[i], hi[i] = max(lo[i], r[0]), min(hi[i], r[1])
+                if lo[i] >= hi[i]:
+                    raise ValueError(f"ik.joint_range.{key} {v} leaves nothing inside the limit margins "
+                                     f"({self.spec.arm_names[i]})")
         self.lo, self.hi = lo, hi
         p = cfg["grasp"]["point_in_palm"]
         if isinstance(p, str) and p == "auto":

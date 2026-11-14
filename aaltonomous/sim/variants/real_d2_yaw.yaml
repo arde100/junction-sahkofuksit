@@ -1,0 +1,12 @@
+# real_d2 with the robot's body turned per episode about the vertical through the pelvis, relative to the table:
+# the recordings show 1-2 deg of body yaw typical within / between episodes (handoffs/shake/REPORT.md; that was teleop
+# with the robot standing; the finals' leg mode may differ). Objects, boxes and scoring stay put; both cameras and the
+# arms turn with the robot. Seeded by the layout: the same evaluator seed gives the same yaw.
+# Use: docker exec -e AALTO_VARIANT=real_d2_yaw aalto-b bash -lc "aalto sim"
+name: real_d2_yaw
+inherit: real_d2
+notes: real_d2 + per-episode body yaw N(0, 1 deg)
+
+body_yaw:
+  deg: 0.0
+  jitter_deg: 1.0    # sigma; clipped at 3 sigma (GUESS from "1-2 deg typical")

@@ -14,11 +14,14 @@ from isaaclab.utils import configclass
 from tasks.common_config.env_configs import UnitreeManagerBasedRLEnvCfg
 from tasks.common_event.event_manager import SimpleEvent, SimpleEventManager
 from tasks.common_observations.camera_state import get_camera_image
-from tasks.common_observations.dex3_state import get_robot_dex3_joint_states
 from tasks.common_observations.g1_29dof_state import get_robot_boy_joint_states
 
-from . import hooks
+from . import hooks, variant
 from .scene_cfg import AaltoLidSceneCfg, AaltoSceneCfg
+
+# upstream get_robot_dex3_joint_states itself, or (variant right_hand_wiring: spec) a wrapper publishing the right
+# hand's state in joint_spec slot order (variant.py)
+get_robot_dex3_joint_states = variant.dex3_state_func(variant.active())
 
 
 @configclass

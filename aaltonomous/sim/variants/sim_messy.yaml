@@ -1,0 +1,11 @@
+# The organisers' sim with ONLY the object placement made messy, as a held-out selection sim might do it: triangular
+# prisms lying on a rectangular side and touching clusters (the same keys as real_venue_messy). Robot, colours,
+# boxes, mat, lights: upstream. Use: docker exec -e AALTO_VARIANT=sim_messy aalto-b bash -lc "aalto sim"
+name: sim_messy
+notes: upstream sim + half of the prisms lying on a side + a touching cluster in half of the episodes
+
+layout:
+  lying_prism_prob: 0.5
+  cluster_prob: 0.5
+  cluster_spacing: [1.05, 1.25]
+  cluster_n: [2, 4]

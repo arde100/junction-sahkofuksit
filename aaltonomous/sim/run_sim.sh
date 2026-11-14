@@ -7,6 +7,8 @@
 #   Aalto-*: mono head 640x480 on 55555, head RGB-D on 55560, scene service on 55580 (scene_client.py),
 #            sim clock on 55581 (AaltoEnv paces on it; AALTO_PROFILE=1 prints a per-step time breakdown)
 #   AALTO_DR=train|eval_heldout|<yaml>   domain randomization (aalto_task/dr.py; off when unset)
+#   AALTO_VARIANT=real_like|<yaml>       OUR sim edits: gains, wiring, colours, ... (aalto_task/variant.py; off when unset)
+#   AALTO_HAND_GAINS="kp,kd[,arm[,eff]]" Dex3 actuator override, applied after the variant
 #   AALTO_INSTANCE=b   isolated 2nd sim: DDS domain $AALTO_DDS_DOMAIN (7), cams 56555-7, rgbd 56560, scene 56580;
 #                      clients: AALTO_DDS_DOMAIN=7 AALTO_CAM_PORT_BASE=56555 AALTO_SCENE_PORT=56580 AALTO_RGBD_PORT=56560
 # DDS domain 1 (same topics as the real robot); cameras on teleimager ZMQ 55555-55557 (WebRTC off).

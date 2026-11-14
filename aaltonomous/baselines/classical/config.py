@@ -74,6 +74,12 @@ def load_config(path=None, overrides=None, profile=None):
     return cfg
 
 
+def fixed_mapping(cfg):
+    """Rung-1 mapping when there is no instruction at all: task.fixed_mapping, null = tasks.FIXED_MAPPING."""
+    from aaltonomous.interface.tasks import FIXED_MAPPING
+    return dict((cfg.get("task") or {}).get("fixed_mapping") or FIXED_MAPPING)
+
+
 def hand_postures(cfg, spec: JointSpec | None = None):
     """{name: (14,) hand vector} for open / preshape / closed (+ extra postures), validated against the URDF limits."""
     spec = spec or JointSpec()

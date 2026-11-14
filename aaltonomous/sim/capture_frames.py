@@ -6,7 +6,8 @@ together with the ground-truth object poses, for offline perception tests (shape
 Per seed: the scene service places a random layout (and, when the sim runs with AALTO_DR, applies that seed's
 randomization), the objects settle, then one head RGB-D frame is saved as <out>/<seed>.npz with
   rgb (480,640,3) uint8, depth (480,640) uint16 mm, arm_q (14,), objects = json list of {name, color, shape, pos
-  (pelvis), quat_xyzw, yaw_pelvis_rad}, layout = json, dr = json (the sampled DR params or null).
+  (pelvis), quat_xyzw, yaw_pelvis_rad, lying, tilt_deg, ridge_yaw_pelvis_rad (lying: long axis, mod pi)}, layout =
+  json (as placed: a variant's `layout:` adds lying / ridge_yaw / cluster), dr = json (the DR params or null).
 --home first moves the arms to the sim home pose through the evaluator's homing routine (needs DDS; without it the
 arms stay wherever they are, which is the home pose after any finished evaluation).
 Second sim instance: AALTO_SCENE_PORT / AALTO_RGBD_PORT / AALTO_DDS_DOMAIN as for every other client.
@@ -84,8 +85,10 @@ def main(argv=None):
                 continue
             q = o["quat_xyzw"]
             yaw = float(np.arctan2(2 * (q[3] * q[2] + q[0] * q[1]), 1 - 2 * (q[1] ** 2 + q[2] ** 2)))
+            # lying / tilt_deg / ridge_yaw (rad, pelvis frame, mod pi): from the settled pose (scene service state)
             objs.append({"name": o["name"], "color": o["color"], "shape": o["shape"], "pos": o["pos"],
-                         "quat_xyzw": q, "yaw_pelvis_rad": yaw})
+                         "quat_xyzw": q, "yaw_pelvis_rad": yaw, "lying": o.get("lying", False),
+                         "tilt_deg": o.get("tilt_deg"), "ridge_yaw_pelvis_rad": o.get("ridge_yaw")})
         np.savez_compressed(out / f"{seed}.npz", rgb=rgb, depth=depth, arm_q=arm_q, objects=json.dumps(objs),
                             layout=json.dumps(lay), dr=json.dumps(dr))
         n += 1

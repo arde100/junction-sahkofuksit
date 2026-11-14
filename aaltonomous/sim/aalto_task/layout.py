@@ -14,6 +14,8 @@ import numpy as np
 from aaltonomous.interface import tasks
 from aaltonomous.scene.scene import Scene
 
+from . import messy
+
 PELVIS_W = np.array([0.0, 0.0, 0.79])   # pelvis in the sim world; z = scene.yaml pelvis height assumption (0.79 m)
 # Sim arm home pose (rad). Arm zero puts the G1 hands ~6-12 cm above the pelvis, i.e. just above the counter
 # (top = pelvis +1 cm) and over the object band. NB on the G1 a NEGATIVE elbow raises the forearm. This pose
@@ -70,11 +72,16 @@ def assign(sc: Scene, layout):
             raise ValueError(f"layout wants more {ob['color']} {shape} objects than the scene has")
         free[pick] = False
         m = sc.cube_spawn_mat(ob)
+        if ob.get("lying"):                              # on a rectangular side (messy.py): own height + orientation
+            m[2] = messy.spawn_height(sc, ob)
+            q = messy.quat_xyzw(messy.lying_R(shape, ob.get("ridge_yaw", 0.0), ob.get("side", 0)))
+        else:
+            q = yaw_quat_xyzw(mat_yaw_to_pelvis(ob.get("yaw", 0.0)))
         if "z" in ob:                                    # optional centre height (mat coords), e.g. drop tests
             m[2] = float(ob["z"])
         p = sc.mat_to_pelvis(m)
         p[2] += 0.001                                    # 1 mm drop so nothing starts interpenetrating the mat
-        poses[pick] = (p, yaw_quat_xyzw(mat_yaw_to_pelvis(ob.get("yaw", 0.0))))
+        poses[pick] = (p, q)
         active.append(pick)
     parked = [n for n in names if free[n]]
     for i, n in enumerate(parked):

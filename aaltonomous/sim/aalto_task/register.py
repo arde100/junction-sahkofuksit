@@ -2,7 +2,11 @@
 upstream `tasks`). Run: TASK=Aalto-Sort-G129-Dex3-Joint bash aaltonomous/sim/run_sim.sh"""
 import gymnasium as gym
 
-from . import env_cfg
+from . import env_cfg, variant
+
+# AALTO_VARIANT right_hand_wiring: spec -> patch upstream's DDS action provider class before sim_main creates it
+# (no-op otherwise; the state side is in env_cfg)
+variant.install_wiring(variant.active())
 
 for _id, _cfg in (("Aalto-Sort-G129-Dex3-Joint", env_cfg.AaltoSortEnvCfg),
                   ("Aalto-Insert-G129-Dex3-Joint", env_cfg.AaltoInsertEnvCfg)):

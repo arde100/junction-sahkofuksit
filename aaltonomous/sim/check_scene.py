@@ -51,17 +51,26 @@ def main(argv=None):
     ap.add_argument("--lid", action="store_true", help="also run the rung-3 lid checks (Aalto-Insert task)")
     ap.add_argument("--save", default=None, help="save head RGB + depth JPEGs here")
     a = ap.parse_args(argv)
-    sc = Scene.load()
     c = SceneClient(a.host, timeout_ms=10000)
     c.ping()
+    sc = Scene.load()
+    try:     # a sim variant (AALTO_VARIANT) builds and scores another geometry: check against THAT scene
+        sv = c.info().get("variant")
+    except RuntimeError:
+        sv = None
+    if sv:
+        from aaltonomous.sim.aalto_task import variant
+        sc = variant.scene(sv)
+        print(f"sim variant {sv.get('name')}: checking against its scene ({type(sc).__name__})")
 
     # 1. random layouts
     for seed in range(a.n):
         r = c.reset_random(seed)
         st = settle(c)
         errs, moving = [], []
-        for ob, n in zip(r["layout"], r["active"]):
-            want = sc.mat_to_pelvis(sc.cube_spawn_mat(ob))
+        for ob, n in zip(r["layout"], r["active"]):     # the placed layout (a variant may lay prisms on a side)
+            from aaltonomous.sim.aalto_task.messy import spawn_height
+            want = sc.mat_to_pelvis([ob["x"], ob["y"], spawn_height(sc, ob)])
             errs.append(np.linalg.norm(np.asarray(st[n]["pos"]) - want))
             moving.append(st[n]["speed"])
         ev = c.evaluate("sort_fixed")

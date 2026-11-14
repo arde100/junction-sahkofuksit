@@ -226,14 +226,14 @@ DEV = [
 REFUSE = [
     "Red goes left. Red goes right.",
     "Put the red objects in the left bin, not the right bin.",
-    "Put everything except the red objects in the left bin.",
+    "Put everything except the red objects in the bin.",   # ("... in the left bin" is read now: red stays, the
+    # rest goes left: TestStayAndExcept)
     "Don't put anything in the middle bin.",
     "Do not sort the blue objects into the right bin.",
     "Wave to the audience.",
     "Stack the cubes on top of each other.",
     "Banana helicopter purple sky.",
-    "Put the green objects in the left bin.",
-    "Put the orange objects in the left bin.",
+    "Put the white objects in the left bin.",   # (green / orange objects: open vocabulary, test_colors.py)
     "Put the red objects in the left or the right bin.",
     "Put the red objects in the bin.",
     "Put the objects in the bins.",
@@ -485,6 +485,121 @@ class TestCountedAndBetween(unittest.TestCase):
         self.assertEqual(parse_instruction("Leave a gap between the objects and put red in the left bin.").mapping,
                          {"red": L})
         self.assertEqual(parse_instruction("Red objects go between the cubes.").mapping, {})
+
+
+N = None   # "stays on the table" (scene.resolve_bin: a key with value None = no bin)
+
+
+class TestStayAndExcept(unittest.TestCase):
+    """'Stay' is an outcome: 'everything but / except / apart from X', 'X stay ...', 'leave X ...', 'don't touch X',
+    'leave the rest' (no default). Written for P1 (not the evaluator's instruction_sets sentences)."""
+    CASES = [
+        # A: everything but X
+        ("Put everything but the cubes in the right bin.", {"default": R, "cube": N}),
+        ("Move all objects but the yellow ones to the middle box.", {"default": C, "yellow": N}),
+        ("All but the cylinders go left.", {"default": L, "cylinder": N}),
+        ("Everything apart from the blue pieces belongs in the left bin.", {"default": L, "blue": N}),
+        ("Aside from the triangles, put everything in the middle.", {"triangle": N, "default": C}),
+        ("Put everything other than red in the right box.", {"default": R, "red": N}),
+        ("Everything that isn't yellow goes left.", {"default": L, "yellow": N}),
+        ("Put everything except the red objects in the left bin.", {"default": L, "red": N}),
+        ("Everything except the red cubes goes in the left bin; the red cubes go right.",
+         {"default": L, ("red", "cube"): R}),
+        ("Everything goes in the middle bin except the blue ones, which go in the left bin.",
+         {"default": C, "blue": L}),
+        ("Everything goes into the right box except the cylinders, which stay where they are.",
+         {"default": R, "cylinder": N}),
+        # B: X stay, the rest -> B
+        ("The yellow ones remain on the table, and all other objects go in the right bin.",
+         {"yellow": N, "default": R}),
+        ("Cylinders stay where they are; put everything else in the middle box.", {"cylinder": N, "default": C}),
+        ("Blue stays. The rest goes left.", {"blue": N, "default": L}),
+        # C: leave X, the rest -> B
+        ("Leave the cubes alone and put all the other objects in the left bin.", {"cube": N, "default": L}),
+        ("Keep the red pieces on the table; everything else goes in the centre box.", {"red": N, "default": C}),
+        ("Don't touch the triangles, but move everything else to the right bin.", {"triangle": N, "default": R}),
+        ("Ignore the blue objects and put the rest in the right bin.", {"blue": N, "default": R}),
+        # D: bin first, then a stay / rest clause: no default
+        ("The middle bin is for yellow objects; leave the rest where they are.", {"yellow": C, "default": N}),
+        ("Use the right box for the cylinders, and the other objects stay on the table.",
+         {"cylinder": R, "default": N}),
+        ("The left bin takes the red ones. Nothing else needs to move.", {"red": L, "default": N}),
+        ("Into the left bin go the blue pieces; do not move anything else.", {"blue": L, "default": N}),
+        # a stay beats the broader keys for its objects
+        ("Red goes left, but leave the red triangles on the table.", {"red": L, ("red", "triangle"): N}),
+        ("Cubes go in the middle bin, everything else in the right one; don't move the yellow cubes.",
+         {"cube": C, "default": R, ("yellow", "cube"): N}),
+        ("Red goes left. Do not move the cubes.", {"red": L, "cube": N, ("red", "cube"): N}),
+    ]
+
+    def test_cases(self):
+        for s, exp in self.CASES:
+            r = parse_instruction(s)
+            self.assertEqual(r.mapping, exp, f"{s}: {r.summary()}")
+
+    def test_object_bin_with_stays(self):
+        m = {"red": N, "default": L}
+        self.assertEqual([object_bin(m, "red", "cube"), object_bin(m, "blue", None), object_bin(m, "unknown", "cube")],
+                         [None, L, None])
+        self.assertEqual(resolve_bin(m, "red", "cube"), None)
+
+    def test_negation_with_a_bin_is_no_stay(self):
+        """'do not move X to the right bin' does not say where X goes: a negation (not ok), not a stay."""
+        r = parse_instruction("Do not move the blue objects to the right bin.")
+        self.assertEqual((r.mapping, r.ok), ({}, False))
+        r = parse_instruction("Leave the red ones in the left bin.")       # (keep / leave X in a bin: put it there)
+        self.assertEqual(r.mapping, {"red": L})
+
+    def test_conflict_with_a_default_stays(self):
+        """A key dropped as a conflict falls to no broader key: its objects stay (they would otherwise get the
+        default)."""
+        r = parse_instruction("Red goes left. Red goes right. Everything else goes in the middle.")
+        self.assertEqual(r.mapping, {"default": C, "red": N})
+
+    def test_two_bins_in_two_clauses(self):
+        """'... into the right-hand bin and the left bin is for everything else': two clauses, not one term."""
+        r = parse_instruction("Blue goes to the bin on the left, but the round blue ones go to the right-hand bin and "
+                              "the left bin is for everything else.")
+        self.assertEqual(r.mapping, {"blue": L, ("blue", "cylinder"): R, "default": L})
+        r = parse_instruction("Red goes in the left-hand bin and the right bin takes the cubes.")
+        self.assertEqual(r.mapping, {"red": L, "cube": R})
+        self.assertEqual(parse_instruction("The left and right bins are for red.").mapping, {})   # (as before)
+
+
+class TestUnread(unittest.TestCase):
+    """A word in object position the lexicon cannot read: that phrase gives no key, and every key that could take its
+    objects (a default always could) is dropped; its bin is never given to another phrase. Never a wrong bin."""
+    CASES = [
+        ("The knobbly pieces go left and everything else goes right.", {}),
+        ("Put the hexagonal ones in the left bin, the cubes in the middle bin, and the rest in the right bin.",
+         {"cube": C}),
+        ("The fluted red pieces go to the right box; put the yellow ones in the middle; the others go left.",
+         {"yellow": C}),
+        ("Red goes left, and the star shaped pieces go right.", {}),
+        ("Cubes left, the egg shaped ones in the middle, triangles right.", {"cube": L, "triangle": R}),
+        ("The left box is for the knobbly pieces, the middle box for yellow.", {}),   # (knobbly yellow ones?)
+        ("The left box is for the knobbly blue pieces, the middle box for yellow.", {"yellow": C}),
+        ("Put the spotted blue ones in the left bin and the red ones in the right bin.", {"red": R}),
+    ]
+
+    def test_cases(self):
+        for s, exp in self.CASES:
+            r = parse_instruction(s)
+            self.assertEqual(r.mapping, exp, f"{s}: {r.summary()}")
+            self.assertFalse(r.ok, s)
+            self.assertIn("unread", [p["kind"] for p in r.problems], s)
+
+    def test_harmless_adjective(self):
+        """Next to both a colour and a shape an unknown word is an adjective, not a missing shape / colour."""
+        r = parse_instruction("Put the shiny red cubes in the left bin.")
+        self.assertEqual((r.mapping, r.ok), ({("red", "cube"): L}, True))
+
+    def test_new_shape_words(self):
+        for s, exp in (("The boxy pieces go left.", {"cube": L}), ("Barrel-shaped pieces go in the middle.",
+                                                                   {"cylinder": C}),
+                       ("Put the three-sided ones on the right.", {"triangle": R}),
+                       ("The box-shaped red objects go in the left bin.", {("red", "cube"): L})):
+            self.assertEqual(parse_instruction(s).mapping, exp, s)
 
 
 class TestOracle(unittest.TestCase):

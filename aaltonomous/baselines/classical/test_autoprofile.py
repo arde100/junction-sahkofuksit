@@ -27,6 +27,7 @@ from .mock_world import REAL_WORLD, SIM_SAG_GAIN, make_mock_env
 
 BASE = load_config(profile="none")
 AC = BASE["autoprofile"]
+REAL_HELD_GAP = 0.3   # mock real world: held fingers stop this short of the base (cage) closed posture (test_sag.py)
 SPEC = JointSpec()
 SNIPS = json.loads((Path(__file__).parent / "testdata" / "autoprofile_snippets.json").read_text())
 
@@ -82,6 +83,16 @@ class TestDecision(unittest.TestCase):
                 (SIM, REAL): (SIM, "contradiction"), (REAL, SIM): (SIM, "contradiction"), (WEAK, WEAK): (SIM, "weak")}
         for votes, res in want.items():
             self.assertEqual(decide(*votes), res, votes)
+
+    def test_contradiction_goes_to_the_clearly_clearer_vote(self):
+        """One controller votes sim, the other real: the clearer one wins only when it is clearly clearer. Measured
+        in our real-like sim (arm PD as the robot's runner, frictionless fingers): hand sim x1.7, arm real x5.8."""
+        self.assertEqual(decide(SIM, REAL, 1.7, 5.8), (REAL, "contradiction"))     # robot arm, well-tracking fingers
+        self.assertEqual(decide(REAL, SIM, 4.0, 15.0), (SIM, "contradiction"))     # sim: a finger touching something
+        self.assertEqual(decide(SIM, REAL, 9.0, 3.3), (SIM, "contradiction"))      # sim: the arm bumped
+        self.assertEqual(decide(SIM, REAL, 2.0, 2.9), (SIM, "contradiction"))      # arm real, but not clearly: doubt
+        self.assertEqual(decide(SIM, REAL, 2.5, 4.0), (SIM, "contradiction"))      # clear, but not twice the other
+        self.assertEqual(decide(REAL, SIM, 6.0, 2.0), (REAL, "contradiction"))
 
     def test_votes_and_margins(self):
         lim = AC["hand"]
@@ -273,6 +284,42 @@ class TestNonBlocking(unittest.TestCase):
         self.assertEqual(env.filter.clipped_steps, 0)
         self.assertTrue(pol.wait_ready(10.0))
 
+    def test_reset_never_waits_for_a_stale_look(self):
+        """An episode can end (time limit) while its look / planning thread still runs. The next reset must return
+        at once and act() must hold a constant target until that thread has ended: the runner safe-stops an episode
+        after 1 s without a command (seen: a 30 s wait in reset -> safe stop -> failed sim gate)."""
+        from .policy_server import ClassicalServerPolicy
+        for wrapped in (False, True):
+            inner = ClassicalServerPolicy(profile="sim")
+            pol = AutoProfilePolicy(lambda p, inner=inner: inner, log=None, background=False) if wrapped else inner
+            env = make_mock_env(seed=0, world="sim", cfg=load_config(profile="sim"))
+            obs = env.reset()
+            pol.reset(obs["instruction"])
+            for _ in range(40 if wrapped else 3):          # (wrapped: through the probe, so the delegate is in use)
+                obs, _ = env.step(pol.act(obs))
+            stale = inner.pol._job = {"obs": obs, "result": None}     # a look that is still running
+            obs = env.reset()
+            c0 = time.perf_counter()
+            pol.reset(obs["instruction"])
+            self.assertLess(time.perf_counter() - c0, 0.2, "reset waited for the stale look")
+            self.assertTrue(inner.reset_waiting())
+            slow, targets = [], []
+            for _ in range(60):                             # 2 s of holding: no reset of the inner policy yet
+                c0 = time.perf_counter()
+                a = pol.act(obs)
+                slow.append(time.perf_counter() - c0)
+                targets.append(np.asarray(a["arm_q_target"], float)[-1])
+                obs, _ = env.step(a)
+                self.assertIs(inner.pol._job, stale)
+            self.assertLess(max(slow), 0.05)
+            self.assertLess(float(np.abs(np.diff(targets[2:], axis=0)).max()), 1e-9)     # a constant hold
+            stale["result"] = ("error", "stale")            # the old thread ends
+            for _ in range(10):
+                obs, _ = env.step(pol.act(obs))
+            self.assertFalse(inner.reset_waiting())
+            self.assertIsNot(inner.pol._job, stale)         # the deferred reset has run
+            self.assertEqual(env.filter.clipped_steps, 0)
+
     def test_act_while_building_classical(self):
         """The real ClassicalServerPolicy builds (CPU-bound, GIL) while the probe runs: act() latency stays small.
         (The server itself waits for the build before it listens; this is the margin if it did not.)"""
@@ -359,7 +406,7 @@ class TestEpisodes(unittest.TestCase):
 
     def episode(self, world, seed):
         cfg = load_config(profile=self.pol.profiles[world])   # the mock grasps with that world's postures
-        env = make_mock_env(seed=seed, world=world, cfg=cfg)
+        env = make_mock_env(seed=seed, world=world, cfg=cfg, **({"held_gap": REAL_HELD_GAP} if world == REAL else {}))
         obs = env.reset()
         self.pol.reset(obs["instruction"])
         while True:

@@ -1,7 +1,8 @@
 # Classical baseline (`sort_fixed`, `sort_language`)
 
-Head RGB-D → HSV colour blobs + depth → object top centre in the pelvis frame → top-down "claw" grasp planned with
-Pinocchio IK → carry to the object's bin (read from the instruction text; rung 1: red → left, yellow → center, blue → right) → release → home → look again, until nothing sortable is left
+Head RGB-D → HSV colour blobs + depth → object top centre in the pelvis frame → top-down grasp (robot / base: the
+"cage", thumb against both fingers, commanded deep for the kp 1.5 fingers; sim profile: thumb-opposed pinch) planned with
+Pinocchio IK → carry to the object's bin (read from the instruction text; no text: `task.fixed_mapping`, sim red → left, yellow → center, blue → right) → release → home → look again, until nothing sortable is left
 (`done`). Plans are pre-checked against the safety filter (0 clips). Cross-body objects are put down where the other
 arm can finish. Meant as a floor and a code reference.
 
@@ -16,15 +17,33 @@ a -1 guess). Nothing understood -> nothing sorted; no instruction -> the fixed m
 was understood. Tests: `test_instruction.py` (templates, 128 development + held-back paraphrases, refusals),
 `test_classical.py TestInstructionEpisodes` (mock episodes).
 
+Colours (`colors.py`): an open vocabulary. The reader accepts any colour word under a canonical name ("violet" →
+purple, "amber" → orange); per episode the named colours are matched to the world's colour classes
+(`perception.color.refs`, measured hues: sim red / yellow / blue, robot orange / yellow / purple): a word that is a
+class uses its measured hue, another one merges with the unnamed class nearest to its lexicon hue ("red" on the robot
+= the orange objects) unless that is ambiguous; colours that cannot be told apart become one class that gets a bin only
+where all its names agree. The reset log's second line (`colour classes: ...`) says what was matched; each look line
+carries every detection's own hue (`/H11.6`, clipped pixels excluded) to tune the references. After every look the
+scene calibrates the classes (`colors.Calibrator`, `perception.color.calib`): blob hues → clusters → assigned to the
+named colours one-to-one (a common white-balance shift allowed on the robot); a clear assignment moves its class for
+the episode (logged `colour calibration: ...`), an unclear one decides nothing; per object a class needs a margin
+(`color.obj_margin`). Tests: `test_colors.py`.
+
 | File | What |
 |---|---|
 | `perception.py` | HSV masks + head depth → detections in the pelvis frame (`interface/calibration.yaml`) |
+| `bins.py` | The three boxes from the levelled head depth every look (`perception.boxes`): wall points → FFT template search over yaw → per-box trimmed fit (centre, yaw, side; rim height), coverage / wall-inside checks, names by row position, fused over the episode. Mode `on` (base = robot): the detected boxes drive drop slots, carry / drop heights, rim clearances, object masks; a box not found or not certainly named gets nothing. `log` in profile sim (scene.yaml + registration as before). Tests / reports: `test_bins.py` (`python -m ...test_bins grid / reach / frames`) |
+| `far.py` | Far release (`grasp.far`, on in base, off in sim): a detected box with no reachable drop slot gets a release with the hand tilted for reach (approach axis <= 60 deg, the object ahead of the wrist) up to shoulder height; the opening hand pushes the object 1.5-6 cm forward (`release_shift`, sim-measured); accepted only if it then lands inside the near wall at the nominal box pose (short = rim / counter = 0, retried), with margin at the far wall (boxes at the table's far edge: long = -1) and the sides (`release_side`: releases stay near the middle line), the wrist (camera bracket) 5 cm above the rims; landings the head camera can see preferred; else the object stays. `Planner.box_reachable`: the policy skips a box no arm can deliver into before planning (one line per look); `policy.look_budget_s` caps a look's planning. Reach map: `python -m ...far map [along ...]`. Release in motion: studied, dropped (module doc). Lab: `sim/far_lab.py`; tests `test_far.py` |
+| messy objects | `perception.lying` (`_lying`): flat top / ridge (prism on a side: shape triangle, `lying`, `ridge_yaw`) / rounded top (cylinder on its side) / unsure (shape None) from the blob's height profile; `perception.touching` (`_split_touching`): one-colour blobs of touching objects cut into their objects; planner: a lying object is pinched on its two flat ends (fingers along the ridge, `grasp.face_align.lying*`, any profile), neighbours on in every profile, outer objects of a cluster first (`neighbours.order_free`). Reports: `eval_messy.py` (frames or `--mock N`); tests `test_messy.py` |
+| `still.py` | Stillness gate before a look (`still`, robot profile): two head images `dt_s` apart, corners outside the arms' silhouettes tracked + RANSAC similarity, look when the motion <= `thr_px`, else wait (timeout: look anyway, logged) |
 | `kinematics.py` | Pinocchio FK/IK on the G1 URDF (`third_party/xr_teleoperate/.../g1_body29_hand14.urdf`) |
 | `planner.py` | Cartesian waypoints → 30 Hz joint trajectories, safety pre-check; paired cycle (`two_arm`, sim profile): one object per arm from one look, merged with the second arm delayed until the arm-arm sphere model keeps `min_clearance`; parked arm (`two_arm.avoid_parked`, sim profile): a single-arm plan that comes too close to the waiting arm gets an evade (that arm moves to a `two_arm.clear_poses` pose and back in the same queue) or is skipped; drop slots (`grasp.slots`): reach-tested release points per bin and arm, the one farthest from what is already in the bin; neighbours (`neighbours`, sim profile): every tick keeps the arm's sphere model clear of the other objects (cylinders); face-aligned grasps (`grasp.face_align`, sim profile) from the detected shape + yaw |
 | `instruction.py` | Instruction text → mapping + evidence + problems (`parse_instruction`); one object's bin (`object_bin`) |
+| `colors.py` | The episode's colour classes: the mapping's colour words matched to the world's measured classes (`match_colors`) |
 | `policy.py` | `ClassicalPolicy`: state machine; target bin per object from the instruction (`bin_for`); plans in a thread and returns holds meanwhile; per-object tries; delivered objects' release points (slots); an object blocked by a neighbour waits for it, least-bad rule last |
 | `verify.py` | Grasp verification from the finger joints (`verify`, sim profile): a verified miss / slip aborts the carry |
 | settle and correct | `grasp.correct` (on, base and sim): the arm dwells at the grasp pose (phase `settle`), the policy measures the grasp point's tracking error (FK of measured vs commanded joints: the PD arms sag ~8 mm without gravity compensation) and shifts that arm's queued ticks to cancel it before the hand closes (`Planner.correction_dq` / `correct`, every guard or the queue stays as planned; log line `correct <side>: ...`); tests `test_correct.py` |
+| `sag.py` | Gravity-sag feed-forward (`sag`, on in base and sim): the arms are position-controlled without gravity compensation (sim ~300 Nm/rad; the robot runner kp 80 / 40, no torque feed-forward: 3.5-10x the sim's sag, 2-5 cm at the hand), so the policy sends intended + clip(-G * gravity torque) and plans / checks / corrects in intended space (the planner's dry run and speed limits see the commanded ticks). G is learned online from still samples (the detector's probe, home settles, grasp settles; robust per-joint least squares around the prior, bounded, refuses contact samples, compensates less where the error is not proportional to the torque) and blended in only in the settle before a look. Log lines `sag feed-forward: ...`; replay on the sim recordings: grasp point 9 mm -> 0.5 mm before the correction; tests `test_sag.py` |
 | `policy_server.py` | The same policy behind the submission protocol (port 8000) = **reference submission** |
 | `autoprofile.py` | One image for the sim selection and the robot finals (`AALTO_PROFILE=auto`, the image default): at the start of every episode a 0.6 s probe (arms held where measured, fingers curled 0.2 rad) tells the Isaac sim from the real G1 by two signatures, finger error at rest (sim < 1 mrad, real >= 48 mrad) and arm error vs the sim's sag model (sim ~0.1 mrad, real >= 8 mrad); the episode then runs on profile `sim` or `none` (both built at start-up). When in doubt: `sim`. One log line per episode (`autoprofile ep N: ...`); tests `test_autoprofile.py` |
 | `config.yaml` | Everything tunable (HSV ranges, grasp, home pose, speeds, hand postures); `profiles.sim` = sim-tuned overrides |
@@ -58,7 +77,8 @@ margin). Drop slots (`grasp.slots`) are on in the base config too: they are deri
 reach (switch off -> `grasp.drop_offsets` as before). The HSV floor,
 grasp point and `open` posture are in the base config but were also only checked in the sim.
 Tests of these: `test_grasp_plan.py`. Unit tests run on profile `sim_legacy` (`sim` + the grasp they were written
-for, settle and correct off; also for sim A/B runs), `TestSimProfile*` and `test_correct.py` on `sim`.
+for, settle and correct off, sag feed-forward off; also for sim A/B runs), `TestSimProfile*`, `test_correct.py` and
+`test_sag.py` on `sim` / `none`.
 
 ## Run it
 

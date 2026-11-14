@@ -463,9 +463,11 @@ class TestConfig(unittest.TestCase):
         finally:
             if env is not None:
                 os.environ["AALTO_SET"] = env
-        base = load_config(profile="none")
+        old_claw = {"open": [0.0, -0.5, 1.5, -0.4, -0.4, -0.4, -0.4], "preshape": [0.0, -0.5, 1.5, -0.4, -0.4, -0.4, -0.4],
+                    "closed": [0.0, -0.1, 1.2, -1.0, -0.6, -1.0, -0.6],
+                    "release": [0.0, -0.5, 1.5, -0.05, -0.05, -0.05, -0.05]}   # (the base claw until 2026-11-14)
         for k in ("open", "preshape", "closed", "release"):
-            self.assertEqual(old["hand"][k], base["hand"][k])
+            self.assertEqual(old["hand"][k], old_claw[k])
         self.assertIsNone(old["hand"]["right"])
         self.assertEqual(old["grasp"]["point_in_palm"], [0.099, -0.084, 0.015])
         self.assertEqual(old["ik"]["joint_margin"], {"wrist_roll": 0.22, "wrist_pitch": 0.19, "elbow": 0.19})
@@ -473,10 +475,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual([old["neighbours"][k] for k in ("margin", "floor", "order_free")], [0.005, -0.012, 0.07])
         self.assertEqual((old["grasp"]["extra_hints"], old["right_hand_slots"]), ([], None))
         self.assertFalse(old["grasp"]["correct"]["enabled"])           # (sim: on; test_correct.py)
+        self.assertFalse(old["sag"]["enabled"])                        # (sim: on; test_sag.py)
         pinned = {"hand", "grasp.point_in_palm", "ik.joint_margin", "grasp.face_align.triangle_phi_deg",
                   "grasp.face_align.cube", "neighbours.margin", "neighbours.floor", "neighbours.order_free", "profile",
                   "grasp.extra_hints", "right_hand_slots", "grasp.face_align.carry_weight",
-                  "grasp.correct.enabled"}
+                  "grasp.correct.enabled", "sag.enabled"}
 
         def flat(d, pre=""):
             for k, v in d.items():
@@ -491,9 +494,13 @@ class TestIKLimits(unittest.TestCase):
     def test_per_joint_margin(self):
         spec = JointSpec()
         cfg = load_config(overrides={"ik.joint_margin": {"wrist_roll": 0.22, "wrist_pitch": 0.19, "elbow": 0.19}})
-        base, sim = ArmKinematics(load_config(profile="none")), ArmKinematics(cfg)
+        bc = load_config(profile="none")
+        base, sim = ArmKinematics(bc), ArmKinematics(cfg)
         i = spec.arm_names.index("right_wrist_roll_joint")
-        self.assertAlmostEqual(base.lo[i], spec.arm_lower[i] + 0.08)
+        # (base = the robot: per-joint margins with room for the sag feed-forward, test_sag.py, and the real arms'
+        # observed range ik.joint_range, mirrored onto the right arm: TestJointRange)
+        self.assertAlmostEqual(base.lo[i], max(spec.arm_lower[i] + bc["ik"]["joint_margin"]["wrist_roll"],
+                                               -bc["ik"]["joint_range"]["wrist_roll"][1]))
         self.assertAlmostEqual(sim.lo[i], spec.arm_lower[i] + 0.22)
         self.assertAlmostEqual(sim.hi[i], spec.arm_upper[i] - 0.22)
         j = spec.arm_names.index("left_shoulder_pitch_joint")          # joints without an entry keep limit_margin
@@ -506,6 +513,38 @@ class TestIKLimits(unittest.TestCase):
             q, ok = sim.solve(side, p, home)[:2]
             self.assertTrue(ok)
             self.assertTrue(np.all(q >= sim.lo - 1e-6) and np.all(q <= sim.hi + 1e-6))
+
+
+class TestJointRange(unittest.TestCase):
+    def test_range_is_mirrored_and_intersected(self):
+        """ik.joint_range (LEFT convention): the right arm gets [-hi, -lo] on the roll / yaw joints, the same range on
+        pitch joints / elbow; intersected with the margins; unknown joints and empty ranges are errors; base = the
+        real arms' observed envelope (home inside it), sim / sim_legacy / oracle: none (URDF limits)."""
+        from aaltonomous.sim.oracle import ORACLE_OVERRIDES
+        spec = JointSpec()
+        cfg = load_config(profile="none", overrides={"ik.joint_range": {"wrist_roll": [-0.5, 1.0],
+                                                                        "wrist_pitch": [-1.2, -0.2], "elbow": [-5, 5]}})
+        kin = ArmKinematics(cfg)
+        i = {n: spec.arm_names.index(n) for n in spec.arm_names}
+        self.assertEqual((kin.lo[i["left_wrist_roll_joint"]], kin.hi[i["left_wrist_roll_joint"]]), (-0.5, 1.0))
+        self.assertEqual((kin.lo[i["right_wrist_roll_joint"]], kin.hi[i["right_wrist_roll_joint"]]), (-1.0, 0.5))
+        for s in ("left", "right"):
+            self.assertEqual((kin.lo[i[f"{s}_wrist_pitch_joint"]], kin.hi[i[f"{s}_wrist_pitch_joint"]]), (-1.2, -0.2))
+            j = i[f"{s}_elbow_joint"]   # wider than the margins: the margins stay
+            self.assertAlmostEqual(kin.lo[j], spec.arm_lower[j] + cfg["ik"]["joint_margin"]["elbow"])
+        for bad in ({"wrist_twist": [0, 1]}, {"wrist_roll": [1, 0]}, {"wrist_pitch": [3.0, 4.0]}):
+            with self.assertRaises(ValueError):
+                ArmKinematics(load_config(profile="none", overrides={"ik.joint_range": bad}))
+        base = load_config(profile="none")
+        kb = ArmKinematics(base)
+        home = home_arm(base)
+        self.assertTrue(np.all(home >= kb.lo) and np.all(home <= kb.hi))
+        q, ok = kb.solve("left", SC.mat_to_pelvis([0.55, 0.15, 0.5 * SC.object_height()]), home)[:2]
+        self.assertTrue(ok)
+        self.assertTrue(np.all(q >= kb.lo - 1e-9) and np.all(q <= kb.hi + 1e-9))
+        for prof in ("sim", "sim_legacy"):
+            self.assertIsNone(load_config(profile=prof)["ik"]["joint_range"])
+        self.assertIsNone(load_config(profile="none", overrides=ORACLE_OVERRIDES)["ik"]["joint_range"])
 
 
 class TestIK(unittest.TestCase):
@@ -601,8 +640,8 @@ class TestPlannerFeatures(unittest.TestCase):
     def test_profiles(self):
         base, sim = load_config(profile="none"), load_config(profile="sim")
         self.assertEqual([base["motion"][k] for k in ("shortcut_tol", "joint_carry_first", "bin_margin")],
-                         [None, False, 0.01])
-        self.assertEqual([base["grasp"]["reach_check"], base["grasp"]["drop_offsets"]], [False, [[0.0, 0.0]]])
+                         [0.01, True, 0.01])                    # (shortcut + joint-space carry in base since H1)
+        self.assertEqual([base["grasp"]["reach_check"], base["grasp"]["drop_offsets"]], [True, [[0.0, 0.0]]])
         self.assertEqual([sim["motion"][k] for k in ("shortcut_tol", "joint_carry_first", "bin_margin")],
                          [0.01, True, 0.0])
         self.assertTrue(sim["grasp"]["reach_check"])
@@ -777,12 +816,14 @@ class TestPlannerFeatures(unittest.TestCase):
 class TestVerify(unittest.TestCase):
     def test_profiles(self):
         base, sim = load_config(profile="none"), load_config(profile="sim")
-        self.assertFalse(base["verify"]["enabled"])               # real robot: today's behaviour
+        self.assertTrue(base["verify"]["enabled"])                # real robot: the cage's shortfall (H1 grasp lab)
+        self.assertEqual([base["verify"][k] for k in ("signal", "after_s", "empty_below", "confirm")],
+                         ["finger_shortfall", 1.0, 0.12, 2])
         self.assertEqual([base["policy"][k] for k in ("max_attempts", "same_object_radius")], [2, 0.03])
         self.assertTrue(sim["verify"]["enabled"])
         self.assertEqual([sim["verify"][k] for k in ("after_s", "empty_below", "confirm")], [1.0, 0.008, 2])
         self.assertEqual([sim["policy"][k] for k in ("max_attempts", "same_object_radius")], [5, 0.06])
-        self.assertIsNone(ClassicalPolicy(log=None, config=base).abort_planner)
+        self.assertIsNotNone(ClassicalPolicy(log=None, config=base).abort_planner)
 
     def test_monitor(self):
         from .verify import GraspMonitor

@@ -1,0 +1,50 @@
+# The real setup of data drop 2 (handoffs/drop2/REPORT.md, 48 teleop episodes, 4 sessions): its MEDIAN session.
+# Use: docker exec -e AALTO_VARIANT=real_d2 aalto-b bash -lc "aalto sim"   (real_d2_far / real_d2_near: other rows)
+# Schema: aaltonomous/sim/aalto_task/variant.py; box row / table: boxes.py. Tags: M = measured on the drop-2 frames
+# (REPORT: measured, or inferred from RGB only, no depth: +- noted), GUESS = ours.
+name: real_d2
+inherit: real_like   # robot (arm / finger PD, Dex3 wiring, full joint range), object colours, colour words
+notes: drop-2 median setup - boxes 10 cm walls / 2 cm gaps / front 0.50, no mat, glossy laminate, 52 mm foam objects, camera 2.8 deg down, thumb_0 stop
+
+robot:
+  joint_limits:      # M: thumb_0 never below -0.26 (left) / -0.22 (right) whatever the command; positive tracks to +0.32
+    left_hand_thumb_0_joint: [-0.26, null]
+    right_hand_thumb_0_joint: [-0.22, null]
+
+colors:                       # albedos tuned through the head camera (probe_variant scene, 2026-11-14 sweep)
+  bins: [140, 41, 28]         # M: orange paper walls, camera 4.9 / 179 / 116 -> seen 4.6 / 191 / 119
+  bin_floor: [127, 128, 96]   # M: cardboard inside, camera 31 / 38 / 119 -> seen 23 / 39 / 163
+  counter: [105, 88, 76]      # M: laminate, camera S 23, V 146 -> seen 16 / 27 / 186 (warm grey-brown)
+
+mat: false           # M: no printed mat
+table:
+  x: [0.09, 1.00]    # GUESS: near edge as scene.yaml's counter; far / side edges big enough for every box row
+  y: [-0.75, 0.75]
+  roughness: 0.3     # M (qualitative): glossy laminate with strong ceiling glare (scene.yaml counter 0.8)
+
+lighting:            # GUESS from frame e00: glare right of centre in front of the boxes, shadows towards the robot ->
+  key: {pos: [1.45, -0.54, 2.2], intensity: 80000.0}    # key light mirrored about the table for the head camera at
+  dome: {intensity: 400.0}                              # pelvis (0.40, -0.12). The camera normalises brightness:
+                     # 25000-120000 changed the seen values by < 5 %; less dome = darker box walls (seen V 119)
+
+head_camera:
+  rot_offset_optical_deg: [-2.8, 0.0, 0.0]   # M: looks 2.8 deg further down than calibration.yaml (+-0.3 stat, +-0.5
+                                             # syst); the policy keeps calibration.yaml
+
+boxes:               # pelvis frame (boxes.py)
+  front_x: 0.50      # M: front-bottom edge of the centre box; sessions 0.53 / 0.48 / 0.51 / 0.52, episodes 0.47-0.62
+  y: 0.0             # GUESS (the real row was centred on the robot within the measurement)
+  gap: 0.02          # M (inferred, +-1 cm): 1.5-2 cm
+  yaw_deg: 0.0       # median; sessions -2 / +7 / -14 / -8 in THIS sign (CCW, + = left end nearer; the report's opposite)
+
+object_physics:
+  mass: 0.02         # GUESS: EVA-foam-looking 50-55 mm parts, ~10-25 g (PLA default 0.05)
+
+scene:
+  bins: {wall_height: 0.10}     # M (inferred, +-1.5 cm): 9-11 cm; outer 0.21 stays (drop 2: 0.21-0.22)
+  objects: {size: 0.052}        # M (inferred, +-10 %): 50-55 mm; meshes scaled, layout spacing 0.08 still >= 2 x 52 mm
+                                # cube circumradius (0.074)
+  layout:                       # the evaluator samples with this too
+    n_cubes: [4, 6]             # M: 4-6 objects per scene
+    region_y: [0.11, 0.21]      # pelvis x 0.25-0.35 (scene.yaml 0.26-0.33): M grasped-object x p10 0.25, median 0.31,
+                                # p90 0.37; 6 objects at 0.08 spacing fail in 30 % of seeds in scene.yaml's band, 0 here

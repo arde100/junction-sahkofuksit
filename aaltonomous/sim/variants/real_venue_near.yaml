@@ -1,0 +1,8 @@
+# real_venue with the boxes' near edge 3 cm nearer (0.47 m from the waist joint): the near end of the venue
+# measurement's uncertainty. Use: docker exec -e AALTO_VARIANT=real_venue_near aalto-b bash -lc "aalto sim"
+name: real_venue_near
+inherit: real_venue
+notes: real_venue with the near edge at 0.47
+
+boxes:
+  front_x: 0.47

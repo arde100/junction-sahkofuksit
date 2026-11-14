@@ -15,10 +15,17 @@ How it reads (structure, not one pattern per phrasing):
      whose meaning depends on their neighbours are decided here: "left" in "what is left" / "left over" = the rest;
      "right" in "right away" / "the right bins" (plural, correct ones) is no position; "left hand" / "right arm"
      without a bin noun after it is the robot's arm; "one(s)" after a position is a bin ("the right one"), after a
-     colour an object; "can" is a cylinder only after a determiner / colour; "orange" is the bins' colour unless an
-     object noun follows ("orange cubes": an unknown object colour).
+     colour an object; "can" is a cylinder only after a determiner / colour; a colour word is the bins' colour (no
+     key) when a bin noun follows directly ("the orange boxes", "the orange plastic bin", "the orange left bin"),
+     else an object colour ("orange cubes", "orange goes left").
+     Colours: an open vocabulary (HUE, _SYN): any chromatic colour word is a key under its canonical name ("violet",
+     "lilac", "magenta" -> purple; "amber" -> orange; "crimson" -> red; "navy" -> blue; "dark" / "light" are fillers);
+     achromatic words (black, white, grey, brown, ...) have no hue to recognise the object by: "unknown colour", the
+     phrase gives nothing. Which objects a colour means is decided per episode against the world's colour classes
+     (colors.py), not here.
      Typos: an unknown word of >= 3 letters one edit (substitution, insertion, deletion, transposition) from exactly
-     one colour / position / shape word of >= 4 letters with the same first letter is read as that word ("yelow",
+     one colour (yellow, blue, orange, purple, violet) / position / shape word of >= 4 letters with the same first
+     letter is read as that word ("yelow", "purpel",
      "rigth", "midle", "traingle"), unless it is a real word listed in _REAL ("lift", "light" ... never reach it
      anyway: different first letter or listed). "red" is too short to correct (only "rde" is read as red).
   2. Bin terms: a position word with its modifiers / bin noun ("the left-most box", "the bin on the right" reads the
@@ -35,8 +42,22 @@ How it reads (structure, not one pattern per phrasing):
      all objects; a bare "the objects" is "default" only alone with one bin ("put the objects in the left bin") and
      right after a determiner (not "shiny objects": an unknown word there may be a misspelt colour).
   4. Clauses: sentences (. ! ? newline, bullets) split at , ; : and / or / then / but / while ... (not the ones
-     consumed in 2 / 3). A clause with a negation word (not, no, except, without, instead, ...) is dropped (problem);
-     if it names objects ("red goes left, but not the cubes"), every key covering any of them is dropped as well.
+     consumed in 2 / 3). A clause with a negation word (not, no, without, instead, ...) is dropped (problem); if it
+     names objects ("red goes left, but not the cubes"), every key covering any of them is dropped as well.
+     Staying is an outcome (value None: the object stays on the table; resolve_bin returns it like a bin):
+     - "everything except / but / apart from / other than X", "everything that is not X" (_Reader._excepts): X is
+       excluded from that default; it stays unless another clause gives it a bin ("..., X go right");
+     - a clause with a stay word and no bin ("X stay on the table", "leave X where they are", "don't touch X",
+       "ignore X", "..., which stay where they are" = the pending objects): X stays; "leave the rest / nothing else
+       needs to move" = the default stays (no default). A stay beats the broader keys for its objects (a shape that
+       stays gets (colour, shape) stays under the colour keys). "do not move X to the right bin" (a bin): a negation.
+     - a key dropped as a conflict / negation whose objects a broader key would take: it stays instead.
+     Unread words: a word the lexicon cannot read standing as an object adjective ("the knobbly pieces", "red
+     star-shaped ones") makes its phrase give nothing, and every key with a bin that could take its objects is
+     dropped (_Reader.result: the unread word next to a colour is a shape word, next to a shape a colour word, else
+     either; shapes / colours that other phrases name are other objects; a default always could): an error (not ok).
+     The phrase still takes its bin (never handed to another phrase). Next to both a colour and a shape such a word
+     is a harmless adjective ("the shiny red cubes").
   5. Pairing, per sentence: "respectively" (or one multi-bin term and as many objects: implicit, a warning) zips
      objects and bins in order. Otherwise a clause with objects and bins pairs them by order and proximity: object
      first ("red goes left") -> each bin takes the objects since the previous bin; bin first ("the left bin is for
@@ -54,7 +75,8 @@ How it reads (structure, not one pattern per phrasing):
      other bin".
 Readings: "box(es)", "container", "basket", ... are bins, never objects or cubes (the bins are orange boxes);
 "block(s)" is a generic object word ("the red blocks" = red objects; "square blocks" = cubes); "square" / "cuboid" /
-"rectangular" = cube, "round" / "circle" / "disc" / "can" = cylinder, "prism" / "wedge" / "pyramid" = triangle ("prism"
+"rectangular" / "boxy" / "box-shaped" = cube, "round" / "circle" / "disc" / "can" / "barrel(-shaped)" / "tubular" =
+cylinder, "prism" / "wedge" / "pyramid" / "three-sided" = triangle ("prism"
 gives way to another shape word in the same phrase: "square prism" = cube). Shape words are always shape keys:
 "the red cubes" is (red, cube), never "red" (literal reading; a warning when every key names the same shape).
 """
@@ -67,11 +89,21 @@ from dataclasses import dataclass, field
 from aaltonomous.interface.tasks import BINS, COLORS, SHAPES
 
 # ---------------------------------------------------------------------------------------------------- lexicon
-_COLOR = {"red": "red", "reds": "red", "crimson": "red", "scarlet": "red",
-          "yellow": "yellow", "yellows": "yellow", "golden": "yellow", "gold": "yellow",
-          "blue": "blue", "blues": "blue", "navy": "blue", "azure": "blue"}
-_OTHER_COLOR = {"green", "greens", "purple", "violet", "pink", "white", "black", "brown", "grey", "gray", "cyan",
-                "magenta", "beige", "silver", "turquoise", "oranges"}        # "orange": the bins' colour (contextual)
+# Colour words -> canonical colour (the mapping key; "violet" is reported as purple). HUE: canonical colour -> the
+# word's usual hue (OpenCV H 0-180) or None (achromatic: nothing to classify by). These hues are only for colours
+# that name no class of the world; the world's own (measured) hues are config perception.color.refs (colors.py).
+HUE = {"red": 0, "orange": 13, "yellow": 27, "green": 60, "cyan": 85, "blue": 115, "purple": 135, "pink": 160,
+       "black": None, "white": None, "grey": None, "brown": None, "beige": None, "silver": None}
+_SYN = {"red": "reds reddish crimson scarlet maroon", "orange": "oranges orangish orangey orangy amber tangerine",
+        "yellow": "yellows yellowish golden gold lemon mustard", "green": "greens greenish lime emerald",
+        "cyan": "teal turquoise aqua", "blue": "blues bluish blueish navy azure cobalt",
+        "purple": "purples purplish violet violets lilac lavender magenta mauve plum indigo fuchsia",
+        "pink": "pinks pinkish", "black": "blacks", "white": "whites", "grey": "gray greys grays", "brown": "browns",
+        "beige": "", "silver": ""}
+_ALL_COLOR = {w + s: c for c, ws in _SYN.items() for w in [c] + ws.split()       # + plurals ("crimsons")
+              for s in ("", "s") if not (s and (w.endswith("s") or w.endswith("ish")))}
+_COLOR = {w: c for w, c in _ALL_COLOR.items() if HUE[c] is not None}             # object colours (keys)
+_OTHER_COLOR = {w for w, c in _ALL_COLOR.items() if HUE[c] is None}               # no hue: "unknown colour"
 # shape words: (shape, is a noun); "prism" is weak (another shape word in the phrase wins)
 _SHAPE = {"cube": ("cube", 1), "cubes": ("cube", 1), "cuboid": ("cube", 1), "cuboids": ("cube", 1),
           "squares": ("cube", 1), "dice": ("cube", 1), "cubic": ("cube", 0), "cubical": ("cube", 0),
@@ -84,6 +116,12 @@ _SHAPE = {"cube": ("cube", 1), "cubes": ("cube", 1), "cuboid": ("cube", 1), "cub
           "triangle": ("triangle", 1), "triangles": ("triangle", 1), "triangular": ("triangle", 0),
           "prism": ("triangle", 1), "prisms": ("triangle", 1), "wedge": ("triangle", 1), "wedges": ("triangle", 1),
           "pyramid": ("triangle", 1), "pyramids": ("triangle", 1)}
+# more shape words (cheap and unambiguous; principle: an unread word in object position is never guessed, see _unread)
+_SHAPE.update({"boxy": ("cube", 0), "blocky": ("cube", 0), "cuboidal": ("cube", 0), "barrel": ("cylinder", 0),
+               "barrels": ("cylinder", 1), "tubular": ("cylinder", 0), "cylindric": ("cylinder", 0),
+               "drum": ("cylinder", 0), "drums": ("cylinder", 1)})
+_SHAPE_PAIR = {("box", "shaped"): ("cube", 0), ("block", "shaped"): ("cube", 0), ("three", "sided"): ("triangle", 0),
+               ("tube", "shaped"): ("cylinder", 0), ("can", "shaped"): ("cylinder", 0)}   # first word read so
 _WEAK_SHAPE = {"prism", "prisms"}
 _OBJ = {"object", "objects", "item", "items", "thing", "things", "piece", "pieces", "block", "blocks", "shape",
         "shapes", "toy", "toys", "part", "parts", "element", "elements", "stuff", "article", "articles", "colour",
@@ -101,8 +139,29 @@ _BINN = {"bin", "bins", "box", "boxes", "container", "containers", "basket", "ba
          "crates", "bucket", "buckets", "tub", "tubs", "receptacle", "receptacles", "compartment", "compartments",
          "bowl", "bowls", "side", "sides", "slot", "slots", "spot", "pile", "piles", "area"}
 _BINN_PLURAL = {w for w in _BINN if w.endswith("s") and w not in ("bins",)} | {"bins"}
-_NEG = {"not", "no", "never", "except", "excluding", "without", "unless", "nor", "neither", "none", "nothing",
-        "besides", "apart", "instead", "avoid"}
+_NEG = {"not", "no", "never", "without", "unless", "nor", "neither", "none", "nothing", "instead", "avoid"}
+# "everything except X": X is excluded from that default ("but" only after everything / all ..., "apart / aside from",
+# "other than"; "that is not X" right after a default phrase: _Reader._excepts)
+_EXC = {"except", "excepting", "excluding", "besides", "exception"}
+# "X stay on the table", "leave X where they are", "don't touch X": X stays (no bin), unless the clause names a bin
+_STAY = {"stay", "stays", "remain", "untouched", "alone", "ignore", "leave", "keep", "unmoved"}
+_MOVE = {"move", "moved", "moving", "touch", "touched", "sort", "sorted", "pick", "picked", "handle", "handled",
+         "disturb", "disturbed", "shift", "shifted", "take", "taken"}
+# words that are no unread object adjective when right before an object noun ("move objects", "sort pieces")
+_NOT_ADJ = (_MOVE | _STAY | {"put", "place", "drop", "throw", "toss", "set", "transfer", "bring", "carry", "get",
+                             "give", "go", "goes", "going", "should", "would", "could", "must", "will", "shall",
+                             "please", "kindly", "then", "now", "just", "only", "simply", "next", "want", "need",
+                             "like", "i", "you", "we", "us", "robot", "make", "let", "help", "do", "does", "to", "in",
+                             "into", "onto", "on", "from", "for", "at", "by", "up", "down", "over", "out", "with",
+                             "where", "here", "there", "two", "both", "few", "some", "several", "many", "more",
+                             "other", "same", "different", "remaining", "own", "following", "these", "those",
+                             "sort", "group", "collect", "gather", "if", "when", "as", "so", "than", "takes",
+                             "gets", "holds", "hold", "receives", "receive", "contains", "contain", "has", "have",
+                             "belong", "belongs", "use", "uses", "fill", "fills", "grab", "lift", "push", "slide",
+                             "deposit", "load", "store", "stash", "send", "dump", "separate", "arrange", "organise",
+                             "organize", "distribute", "return", "see", "find", "sorting", "moving", "placing",
+                             "putting", "dropping", "and", "or", "of", "with", "without", "about", "around",
+                             "regardless", "whatever", "whichever", "their", "its", "his", "her"})
 _SEP = {",", ";", ":", "and", "or", "then", "while", "whereas", "but", "plus", "(", ")", "-", "after", "next",
         "finally", "lastly", "first", "afterwards", "/", "&", "+"}
 _JOIN = {",", "and", "or", "/", "&", "+"}            # may join adjectives / positions into one term
@@ -128,7 +187,8 @@ def _between(w, i):
     return (i > 0 and w[i - 1] == "in") or named or (j < len(w) and w[j] in ("left", "right"))
 _FILL = {"the", "a", "an", "of", "that", "which", "are", "is", "those", "these", "its", "their", "coloured", "colored",
          "shaped", "sized", "small", "little", "big", "large", "tiny", "plastic", "wooden", "foam", "solid", "painted",
-         "bright", "dark", "light", "rounded", "single", "individual", "both", "kind", "kinds", "type", "types"}
+         "bright", "dark", "light", "rounded", "single", "individual", "both", "kind", "kinds", "type", "types",
+         "sided"}
 _NP_FILL = _FILL                                     # words a noun phrase may contain ("objects that are red")
 _CAN_NEXT = {"", ",", ".", ";", ":", "and", "or", "in", "into", "on", "to", "-", "goes", "belongs", "is", "should",
              "must", "will"}                     # "the red can goes left" (noun) vs "the yellow can go left" (modal)
@@ -138,13 +198,17 @@ _REAL = {"lift", "loft", "lest", "lent", "let", "lifts", "lefty", "rights", "rig
          "meddle", "blew", "blur", "blub", "blues", "cute", "cure", "cubs", "cuba", "cub", "cubed", "cures", "prim",
          "prims", "prise", "wedged", "yell", "cent", "cents", "lefts", "ride", "rite", "prisms", "trial", "tribe",
          "mild", "mile", "midst", "cyan", "lead", "leaf", "bled", "blot", "clue", "cubit", "wedgy", "riot", "rig",
-         "rich", "ridge", "might", "midge", "midday", "middy", "pyre", "yeller", "yellows", "boxes", "cylinders"}
+         "rich", "ridge", "might", "midge", "midday", "middy", "pyre", "yeller", "yellows", "boxes", "cylinders",
+         "violent", "oranges", "purples", "pick"}
 _TYPO_TARGETS = ("yellow", "blue", "left", "right", "center", "centre", "middle", "leftmost", "rightmost", "cube",
                  "cubes", "cylinder", "cylinders", "triangle", "triangles", "triangular", "cylindrical", "prism",
-                 "prisms", "wedge", "wedges", "circle", "circles", "square", "squares")
+                 "prisms", "wedge", "wedges", "circle", "circles", "square", "squares", "orange", "purple", "violet")
 _KNOWN = (set(_COLOR) | _OTHER_COLOR | set(_SHAPE) | _OBJ | _DEF | _ALL | set(_POS) | _POSMOD | _BINN | _NEG | _SEP
-          | _TOO | _PRON | _OTHERBIN | _ORDINAL | _FILL | _DET | _REAL | {"orange", "can", "one", "ones", "same", "than",
-                                                                         "respectively", "hand", "arm", "arms"})
+          | _TOO | _PRON | _OTHERBIN | _ORDINAL | _FILL | _DET | _REAL | _EXC | _STAY | _MOVE
+          | {"can", "one", "ones", "same", "than", "respectively", "hand", "arm", "arms", "apart", "aside", "but"})
+# adjectives between a colour and a bin noun that still make the colour the bins' ("the orange plastic boxes")
+_BIN_ADJ = {"plastic", "wooden", "cardboard", "paper", "big", "large", "small", "coloured", "colored", "painted",
+            "bright", "dark", "light", "three", "identical", "open"}
 
 
 def _edit1(a, b):
@@ -207,6 +271,12 @@ def _tokens(text):
     return out
 
 
+def _candidate(word):
+    """A word the lexicon cannot read that may be an object adjective (shape / colour): not a known word, not a verb
+    / function word (_NOT_ADJ)."""
+    return word.isalpha() and len(word) > 1 and word not in _KNOWN and word not in _NOT_ADJ
+
+
 def _classify(words):
     n = len(words)
     w = [x[0] for x in words]
@@ -253,27 +323,47 @@ def _classify(words):
             toks.append(T("ORD", _ORD[x]))                             # "the second bin (from the left)"
         elif x == "so" and nxt in ("do", "does", "should", "must", "will", "are", "is", "go", "goes"):
             toks.append(T("TOO", x))                                   # "and so do the yellow ones"
+        elif (x, nxt) in _SHAPE_PAIR:                                  # "box-shaped", "three-sided"
+            s, noun = _SHAPE_PAIR[(x, nxt)]
+            toks.append(T("SHAPE", s, noun=bool(noun)))
+        elif (x in _EXC or (x in ("apart", "aside") and nxt == "from") or (x == "other" and nxt == "than")
+              or (x == "but" and (prev in ("everything", "anything", "all", "else", "rest", "others")
+                                  or (prev in _OBJ_PLURAL_ALL
+                                      and (prev2 in _ALL | {"other"} or (prev2 == "the" and i > 2
+                                                                         and w[i - 3] in _ALL)))))):
+            toks.append(T("EXC", x))                                   # "everything except / but X"
+        elif (x in _STAY or (x == "where" and nxt in ("it", "they", "these", "those", "each", "everything"))
+              or (x in ("table", "counter") and prev in ("the", "on")) or (x == "place" and prev == "in")
+              or (x == "as" and nxt in ("they", "it") and nxt2 in ("are", "is"))):
+            toks.append(T("STAY", x))                                  # "X stay on the table", "leave X"
+        elif (x in ("not", "never") and (nxt in _MOVE or (nxt == "be" and nxt2 in _MOVE))) \
+                or (x == "nothing" and nxt in ("else", "more")):
+            toks.append(T("STAY", "neg"))                              # "do not move X", "nothing else"
         elif x in _COLOR:
-            toks.append(T("COL", _COLOR[x]))
-        elif x == "orange" or x in _OTHER_COLOR:
-            j = i + 1
-            while j < n and w[j] in _NP_FILL | {"and", ","} | set(_COLOR) | _OTHER_COLOR | {"orange"}:
+            j = i + 1          # a bin noun right after it (adjectives; "the orange left bin"): the bins' colour
+            while j < n and (w[j] in _BIN_ADJ or (w[j] in _POS and prev in _DET)):
                 j += 1
-            obj = j < n and (w[j] in _OBJ or w[j] in _SHAPE or w[j] in ("one", "ones", "cans"))
-            toks.append(T("BADCOL", x) if (obj or x != "orange") and not (j < n and w[j] in _BINN) else T("OTHER"))
+            toks.append(T("OTHER") if j < n and w[j] in _BINN else T("COL", _COLOR[x]))
+        elif x in _OTHER_COLOR:
+            j = i + 1
+            while j < n and w[j] in _NP_FILL | {"and", ","} | set(_ALL_COLOR):
+                j += 1
+            toks.append(T("OTHER") if j < n and w[j] in _BINN else T("BADCOL", x))
         elif x in _SHAPE:
             s, noun = _SHAPE[x]
             toks.append(T("SHAPE", s, noun=bool(noun)))
-        elif x == "can" and (prev in _DET or prev in _COLOR or prev in _OTHER_COLOR) and nxt in _CAN_NEXT:
+        elif x == "can" and (prev in _DET or prev in _ALL_COLOR) and nxt in _CAN_NEXT:
             toks.append(T("SHAPE", "cylinder", noun=True))
         elif x in ("one", "ones"):
             if prev in _POS or (prev in _POSMOD and prev2 in _POS):
                 toks.append(T("BINN", x))                              # "the right one"
-            elif prev in _COLOR or prev in _OTHER_COLOR or prev in _DEF or prev in _ALL or prev in _NP_FILL \
-                    or prev == "orange" or (prev in _SHAPE and not _SHAPE[prev][1]):
+            elif prev in _ALL_COLOR or prev in _DEF or prev in _ALL or prev in _NP_FILL \
+                    or (prev in _SHAPE and not _SHAPE[prev][1]) or _candidate(prev):   # "the knobbly ones"
                 toks.append(T("OBJ", x, noun=True))
             else:
                 toks.append(T("OTHER"))                                # "one by one", "one at a time"
+        elif x in ("last", "far") and nxt in _BINN and nxt2 == "on" and any(v in _POS for v in w[i + 3:i + 6]):
+            toks.append(T("FILL", x))                                  # "the last box on the right": that position
         elif x in _OTHERBIN and (nxt in _BINN or (nxt in ("one",) and x != "other")) and nxt not in _BINN_PLURAL:
             toks.append(T("OTHERBIN", x))                              # "the remaining bin", "the last one"
         elif x == "same" and (nxt in _BINN or nxt in ("one", "place", "spot")):
@@ -324,9 +414,18 @@ class NP:
     typo: list = field(default_factory=list)
     i0: int = 0
     i1: int = 0
+    unread: list = field(default_factory=list)   # words in object position the lexicon cannot read ("boxy")
+    except_of: object = None   # "everything except X": X's phrase -> the default phrase it is excluded from
+
+    def poisoned(self):
+        """An unread word where a shape or a colour should be: the phrase names objects nobody can identify (a
+        word next to both a colour and a shape, "the shiny red cubes", is a harmless adjective)."""
+        return bool(self.unread) and not (self.colors and self.shapes)
 
     def keys(self):
         """Mapping keys this phrase names (empty: none, e.g. only an unknown colour / a bare 'the one')."""
+        if self.poisoned():
+            return []
         sh = list(dict.fromkeys(self.shapes))
         if self.colors and sh:
             return [(c, s) for c in dict.fromkeys(self.colors) for s in sh]
@@ -389,7 +488,12 @@ def _terms(toks):
                     m = k + 1
                     while m < n and toks[m].kind == "FILL" and toks[m].word in ("the", "a", "far", "very"):
                         m += 1
-                    if m < n and toks[m].kind == "POS" and not (toks[k].val == "," and noun_after_first):
+                    m2 = m + 1          # "... the right-hand bin and the left bin is for ...": a new clause
+                    while m2 < n and toks[m2].kind == "FILL" and toks[m2].word in _POSMOD | {"of"}:
+                        m2 += 1
+                    own = (m2 + 1 < n and toks[m2].kind == "BINN"
+                           and toks[m2 + 1].word in _ORD_VERB | {"has", "goes", "gets"})
+                    if m < n and toks[m].kind == "POS" and not (toks[k].val == "," and noun_after_first) and not own:
                         bt.bins.append(toks[m].val)
                         bt.b, bt.i1 = toks[m].b, m
                         if toks[m].typo:
@@ -438,11 +542,17 @@ def _terms(toks):
             units.append(BT([ph], t.a, toks[j].b, i, j))
             i = j + 1
             continue
-        if t.kind in ("COL", "BADCOL", "SHAPE", "OBJ", "DEF", "ALL"):
+        if t.kind in ("COL", "BADCOL", "SHAPE", "OBJ", "DEF", "ALL") or _unread_at(toks, i):
             np_ = NP(a=t.a, b=t.b, i0=i, i1=i)
             j, has_noun, last_adj = i, False, False
             while j < n:
                 u = toks[j]
+                if _unread_at(toks, j):              # "the boxy pieces", "red barrel shaped ones"
+                    np_.unread.append(u.word)
+                    np_.b, np_.i1 = u.b, j
+                    last_adj = True
+                    j += 1
+                    continue
                 if u.kind in ("COL", "BADCOL", "SHAPE", "OBJ", "DEF", "ALL"):
                     if u.kind == "COL":
                         np_.colors.append(u.val)
@@ -480,40 +590,69 @@ def _terms(toks):
             np_.shapes = sh
             # "the objects" = all of them, but not "rde objects" / "shiny objects" (an unknown word may be a colour)
             np_.plural_all &= i > 0 and toks[i - 1].word in ("the", "these", "those", "all", "any", "every", "each")
+            np_.plural_all &= not np_.unread
             units.append(np_)
             i = np_.i1 + 1
             continue
-        if t.kind in ("SEP", "SENT", "NEG", "TOO", "PRON", "RESP"):
+        if t.kind in ("SEP", "SENT", "NEG", "TOO", "PRON", "RESP", "EXC", "STAY"):
             units.append(t)
         i += 1
     return units
+
+
+def _unread_at(toks, j):
+    """toks[j] is a word the lexicon cannot read standing where an object adjective stands: directly before an object
+    / shape word (colours, other unread words and non-determiner fillers between: "barrel shaped pieces", "the knobbly
+    red ones")."""
+    if toks[j].kind != "OTHER" or not _candidate(toks[j].word):
+        return False
+    m = j + 1
+    while m < len(toks) and ((toks[m].kind == "FILL" and toks[m].word not in _DET) or toks[m].kind in ("COL", "BADCOL")
+                             or (toks[m].kind == "OTHER" and _candidate(toks[m].word))):
+        m += 1
+    return m < len(toks) and toks[m].kind in ("OBJ", "SHAPE") and toks[m].word not in ("colour", "colours", "color",
+                                                                                       "colors")
 
 
 # ---------------------------------------------------------------------------------------------------- result
 @dataclass
 class Parse:
     text: str
-    mapping: dict              # key -> bin (conflicting keys dropped)
+    mapping: dict              # key -> bin, or None = stays on the table (scene.resolve_bin semantics); conflicting
+                               # keys dropped (or None where a broader key would otherwise take those objects)
     keys: list                 # [{"key", "bin", "evidence", "conf"}]
     problems: list             # [{"kind", "severity": "error" | "warning", "msg", "text"}]
+    words: dict = field(default_factory=dict)   # canonical colour -> the words written for it ("purple": ["violet"])
 
     @property
     def ok(self):
-        return bool(self.mapping) and not any(p["severity"] == "error" for p in self.problems)
+        return (any(v is not None for v in self.mapping.values())
+                and not any(p["severity"] == "error" for p in self.problems))
 
-    def unsorted(self):
-        """Object types (colour, shape) that get no bin from this mapping."""
-        return [(c, s) for c in COLORS for s in SHAPES if object_bin(self.mapping, c, s) is None]
+    @property
+    def colors(self):
+        """Colours the mapping's keys name, in order (canonical names)."""
+        return mapping_colors(self.mapping)
 
-    def summary(self):
+    def _classes(self, classes):
+        return list(classes) if classes is not None else list(dict.fromkeys(COLORS + tuple(self.colors)))
+
+    def unsorted(self, classes=None):
+        """Object types (colour, shape) that get no bin from this mapping. classes: the episode's colour classes
+        (colors.py), default red / yellow / blue + the colours named."""
+        cl = self._classes(classes)
+        return [(c, s) for c in cl for s in SHAPES if object_bin(self.mapping, c, s, cl) is None]
+
+    def summary(self, classes=None):
         if not self.mapping:
             what = "nothing understood"
         else:
-            what = ", ".join(f"{_kname(k['key'])}->{k['bin']}" + (f" ({k['conf']:.1f})" if k["conf"] < 1 else "")
-                             for k in self.keys)
-        un = set(self.unsorted())
+            what = ", ".join(f"{_kname(k['key'])}->{k['bin'] or 'stays'}"
+                             + (f" ({k['conf']:.1f})" if k["conf"] < 1 else "") for k in self.keys)
+        cl = self._classes(classes)
+        un = set(self.unsorted(cl))
         names = [c if all((c, s) in un for s in SHAPES) else " ".join(
-            [c, "/".join(s for s in SHAPES if (c, s) in un)]) for c in COLORS if any((c, s) in un for s in SHAPES)]
+            [c, "/".join(s for s in SHAPES if (c, s) in un)]) for c in cl if any((c, s) in un for s in SHAPES)]
         rest = f"; no bin: {', '.join(names)}" if self.mapping and un else ""
         probs = "".join(f"; {p['severity']}: {p['msg']}" for p in self.problems)
         return f"{'ok' if self.ok else 'NOT OK'}: {what}{rest}{probs}"
@@ -532,23 +671,36 @@ def resolve_bin(mapping, color, shape=None):
     return None
 
 
-def object_bin(mapping, color, shape=None):
+def object_bin(mapping, color, shape=None, classes=None):
     """Bin of one object, or None (it stays on the counter for now): resolve_bin over every colour / shape the object
-    may have (colour "unknown" / None -> any of COLORS, shape None -> any of SHAPES); one bin for all of them -> that
-    bin, else None. Never a guess: a colour-only mapping needs no shape; a shape key needs the shape."""
-    cs = [color] if color in COLORS else list(COLORS)
+    may have (colour "unknown" / None / an unknown name -> any of the classes, a combined class "red/orange" ->
+    either of them, a lexicon colour that is no class (a distractor named by colors.Calibrator) -> that colour;
+    shape None -> any of SHAPES); one bin for all of them -> that bin, else None. Never a guess: a colour-only
+    mapping needs no shape; a shape key needs the shape. classes: this episode's colour classes (colors.py),
+    default red / yellow / blue."""
+    atoms = list(dict.fromkeys(a for c in (COLORS if classes is None else classes) for a in str(c).split("/")))
+    cs = (color.split("/") if isinstance(color, str) and "/" in color
+          else [color] if color in atoms or color in HUE else atoms)       # a lexicon colour: that colour
     ss = [shape] if shape in SHAPES else list(SHAPES)
-    if color in COLORS and shape in SHAPES:
-        return resolve_bin(mapping, color, shape)
     bins = {resolve_bin(mapping, c, s) for c in cs for s in ss}
     return bins.pop() if len(bins) == 1 else None
+
+
+def _key_colors(k):
+    return [k[0]] if isinstance(k, tuple) else [] if k == "default" or k in SHAPES else [k]
+
+
+def mapping_colors(mapping):
+    """Colours a mapping's keys name (colour and (colour, shape) keys), in order."""
+    return list(dict.fromkeys(c for k in mapping for c in _key_colors(k)))
 
 
 def _clauses(sent):
     """One sentence's units -> clauses {items, neg, too, pron, resp, sep (separator before), end (after)}. Phrases
     that name nothing (a bare "the one") are left out, so they do not decide the clause's order."""
     def new(sep):
-        return {"items": [], "neg": False, "too": False, "pron": False, "resp": False, "sep": sep, "end": None}
+        return {"items": [], "neg": False, "too": False, "pron": False, "resp": False, "sep": sep, "end": None,
+                "stay": False, "stayneg": False}
     segs, seg = [], new(None)
     for u in sent:
         if isinstance(u, Tok) and u.kind == "SEP":
@@ -556,26 +708,28 @@ def _clauses(sent):
             segs.append(seg)
             seg = new(u.val)
         elif isinstance(u, Tok):
-            key = {"NEG": "neg", "TOO": "too", "PRON": "pron", "RESP": "resp"}.get(u.kind)
+            key = {"NEG": "neg", "TOO": "too", "PRON": "pron", "RESP": "resp", "STAY": "stay"}.get(u.kind)
             if key:
                 seg[key] = True
-        elif isinstance(u, BT) or u.keys() or u.plural_all or u.bad:
+            if u.kind == "STAY" and u.val == "neg":
+                seg["stayneg"] = True
+        elif isinstance(u, BT) or u.keys() or u.plural_all or u.bad or u.unread:
             seg["items"].append(u)
     segs.append(seg)
-    return [s for s in segs if s["items"] or s["neg"] or s["too"] or s["pron"] or s["resp"]]
+    return [s for s in segs if s["items"] or s["neg"] or s["too"] or s["pron"] or s["resp"] or s["stay"]]
 
 
-def _objects(k):
-    """The (colour, shape) types a mapping key covers."""
+def _objects(k, colors=COLORS):
+    """The (colour, shape) types a mapping key covers (colors: every colour there may be)."""
     if k == "default":
-        return set(itertools.product(COLORS, SHAPES))
+        return set(itertools.product(colors, SHAPES))
     if isinstance(k, tuple):
         return {k}
-    return {(k, s) for s in SHAPES} if k in COLORS else {(c, k) for c in COLORS}
+    return {(c, k) for c in colors} if k in SHAPES else {(k, s) for s in SHAPES}
 
 
-def _overlap(a, b):
-    return bool(_objects(a) & _objects(b))
+def _overlap(a, b, colors=COLORS):
+    return bool(_objects(a, colors) & _objects(b, colors))
 
 
 def _span(items):
@@ -593,17 +747,76 @@ class _Reader:
         self.prev_pend = []        # objects the previous sentence left without a bin ("The red ones? Left.")
         self.header = None         # a bin heading a list on the next lines ("Left bin:\n- red\n- blue")
         self.neg_keys = []         # keys named in negated clauses
+        self.unread = []           # phrases with an unread word in object position (result: what they could overlap)
 
     def prob(self, kind, sev, msg, items=()):
         a, b = _span(items) if items else (0, 0)
         self.problems.append({"kind": kind, "severity": sev, "msg": msg, "text": self.text[a:b].strip()})
 
+    def _note_unread(self, objs):
+        for o in objs:
+            if o.poisoned() and all(o is not u for u in self.unread):
+                self.unread.append(o)
+
+    def stay(self, objs):
+        """Object phrases that stay on the table ("leave X", "X stay where they are", "the rest stay"): '?stay'."""
+        self._note_unread(objs)
+        objs = [o for o in objs if o.keys()]
+        if objs:
+            a, b = _span(objs)
+            for o in objs:
+                for k in o.keys():
+                    self.assigned.setdefault(k, []).append(("?stay", self.text[a:b].strip(), 1.0))
+
+    def _excepts(self, sent):
+        """'everything except / but / apart from / other than X', 'everything that is not X': the X phrases (and-
+        lists) get except_of = that default phrase (before the marker, else the next one in the sentence); give()
+        then excludes them from its bin. The marker is removed; without such a default it stays a negation."""
+        out, i = [], 0
+
+        def is_def(u):
+            return isinstance(u, NP) and (u.default or (u.alldet and u.generic) or (u.alldet and not u.keys()))
+        while i < len(sent):
+            u = sent[i]
+            mark = isinstance(u, Tok) and (u.kind == "EXC" or (u.kind == "NEG" and u.word == "not" and out
+                                                               and is_def(out[-1])))
+            if not mark:
+                out.append(u)
+                i += 1
+                continue
+            xs, j = [], i + 1
+            while j < len(sent):
+                v = sent[j]
+                if isinstance(v, NP) and not is_def(v):
+                    xs.append(v)
+                    j += 1
+                elif isinstance(v, Tok) and v.kind == "SEP" and v.val in ("and", "or", ",") and xs \
+                        and j + 1 < len(sent) and isinstance(sent[j + 1], NP) and not is_def(sent[j + 1]):
+                    j += 1
+                else:
+                    break
+            anchor = next((v for v in reversed(out) if is_def(v)), None) or \
+                next((v for v in sent[j:] if is_def(v)), None)
+            if not xs or anchor is None:
+                out.append(Tok("NEG", u.word, u.word, u.a, u.b) if u.kind == "EXC" else u)
+                i += 1
+                continue
+            anchor.default = True                    # ("all but the cubes": "all" is everything)
+            for x in xs:
+                x.except_of = anchor
+            i += 1                                   # (the X phrases follow as ordinary units)
+        return out
+
     def give(self, objs, bt, conf=1.0):
         """Object phrases objs -> bin term bt. Generic phrases count only alone ("put the objects in the left bin" =
-        everything); phrases with an unknown colour give nothing (a warning)."""
+        everything); phrases with an unknown colour give nothing (a warning); a phrase excepted from a default phrase
+        in the same group gets '?except' (it stays, unless another clause gives it a bin)."""
         for o in objs:
             if o.bad:
-                self.prob("unknown_colour", "warning", f"colour {'/'.join(o.bad)} is not red / yellow / blue", [o])
+                self.prob("unknown_colour", "warning", f"colour {'/'.join(o.bad)} has no hue to recognise it by",
+                          [o])
+        self._note_unread(objs)
+        here = {id(o) for o in objs}
         spec = [o for o in objs if o.keys()]
         if not spec and objs and all(o.plural_all and not o.bad for o in objs):
             spec, conf = [NP(default=True)], conf * 0.8
@@ -615,14 +828,17 @@ class _Reader:
             conf *= 0.8
         a, b = _span(list(objs) + [bt])
         for o in spec:
+            v = "?except" if o.except_of is not None and id(o.except_of) in here else val
             for k in o.keys():
-                self.assigned.setdefault(k, []).append((val, self.text[a:b].strip(), conf))
+                self.assigned.setdefault(k, []).append((v, self.text[a:b].strip(), conf))
         if isinstance(val, str) and val in BINS:
             self.last_bin = val
 
     def sentence(self, sent):
         segs = []
-        for s in _clauses(sent):
+        for s in _clauses(self._excepts(sent)):
+            if s["stayneg"] and any(isinstance(x, BT) for x in s["items"]):
+                s["neg"] = True                      # "do not move X to the right bin": a negation, not a stay
             if not s["neg"]:
                 segs.append(s)
                 continue
@@ -646,6 +862,15 @@ class _Reader:
             O = [x for x in s["items"] if isinstance(x, NP)]
             B = [x for x in s["items"] if isinstance(x, BT)]
             nxt = segs[k + 1] if k + 1 < len(segs) else None
+            if s["stay"] and not B:                  # "leave X on the table", "the rest stay where they are",
+                tgt = O                              # "..., which stay where they are" (the pending objects)
+                if not tgt and pend:
+                    tgt, pend = [o for o, _ in pend], []
+                elif not tgt and prev_pend and k == 0:
+                    tgt, prev_pend = prev_pend, []
+                self.stay(tgt)
+                last_objs = tgt
+                continue
             if O and B:
                 self.header = pend_b = None
                 if isinstance(s["items"][0], NP):      # object first: a bin takes the objects since the previous bin
@@ -730,6 +955,10 @@ class _Reader:
             return False
         items = [k for o in objs for k in o.keys()]
         bins = [b for bt in bts for b in bt.bins]
+        if any(o.except_of is not None or o.poisoned() for o in objs) or any(s["stay"] for s in segs):
+            self._note_unread(objs)                  # an excepted / staying / unread phrase in a zipped list:
+            self.prob("pairing", "error", "objects and bins in order, with an exception: not paired", objs + bts)
+            return True                              # which bin goes with what is not clear
         if items and len(items) == len(bins) > 1:
             if not resp:
                 self.prob("in_order", "warning", "objects and bins paired in the order given (respectively assumed)",
@@ -749,11 +978,20 @@ class _Reader:
             self.prob("object_without_bin", "warning", "objects without a bin", self.prev_pend)
         used = {v for vs in self.assigned.values() for v, _, _ in vs if v in BINS}
         free = [b for b in BINS if b not in used]
-        keys, mapping, problems = [], {}, list(self.problems)
+        keys, mapping, problems, dropped = [], {}, list(self.problems), []
         for k, vs in self.assigned.items():
             vs = [(free[0], ev, c * 0.7) if v == "?other" and len(free) == 1 else (v, ev, c) for v, ev, c in vs]
-            vals = list(dict.fromkeys(v for v, _, _ in vs))
             ev = " | ".join(dict.fromkeys(e for _, e, _ in vs))
+            st = {v for v, _, _ in vs if v in ("?stay", "?except")}
+            vs = [x for x in vs if x[0] not in ("?stay", "?except")]
+            if st and (not vs or "?stay" in st):     # stays (an except is overridden by an explicit bin; a stay
+                mapping[k] = None                    # and a bin contradict: it stays)
+                keys.append({"key": k, "bin": None, "evidence": ev, "conf": 1.0})
+                if vs:
+                    problems.append({"kind": "conflict", "severity": "error", "text": ev,
+                                     "msg": f"{_kname(k)}: told to stay and given a bin -> stays"})
+                continue
+            vals = list(dict.fromkeys(v for v, _, _ in vs))
             if len(vals) == 1 and vals[0] in BINS:
                 mapping[k] = vals[0]
                 keys.append({"key": k, "bin": vals[0], "evidence": ev, "conf": round(min(c for _, _, c in vs), 2)})
@@ -767,19 +1005,64 @@ class _Reader:
                 why = "assigned to " + " and ".join(vals)
             problems.append({"kind": "conflict", "severity": "error", "msg": f"{_kname(k)}: {why} -> dropped",
                              "text": ev})
-        for k in [k for k in mapping if any(_overlap(k, q) for q in self.neg_keys)]:
+            dropped.append(k)
+        uni = tuple(dict.fromkeys(COLORS + tuple(c for k in list(mapping) + self.neg_keys for c in _key_colors(k))
+                                  + tuple(c for u in self.unread for c in u.colors)))
+
+        def drop(k):
+            if k in mapping:
+                del mapping[k]
+            dropped.append(k)
+        for k in [k for k in mapping if mapping[k] is not None and any(_overlap(k, q, uni) for q in self.neg_keys)]:
             ev = next(e["evidence"] for e in keys if e["key"] == k)
             problems.append({"kind": "negated", "severity": "error", "text": ev,
                              "msg": f"{_kname(k)}: overlaps a negated phrase -> dropped"})
-            del mapping[k]
-            keys = [e for e in keys if e["key"] != k]
-        cols = {k: v for k, v in mapping.items() if k in COLORS}
-        for sh, b in [(k, v) for k, v in mapping.items() if k in SHAPES]:
+            drop(k)
+        # unread object phrases: the types they could mean (an unread word next to a colour is a shape word, next to
+        # a shape a colour, else either; shapes / colours another phrase names are other objects); every key with a
+        # bin that could take one of them is dropped (a default always could)
+        for u in self.unread:
+            cols_named = {c for k in mapping for c in _key_colors(k)} - set(u.colors)
+            shp_named = {k[1] if isinstance(k, tuple) else k for k in mapping
+                         if isinstance(k, tuple) or k in SHAPES} - set(u.shapes)
+            cs = list(u.colors) or [c for c in uni if not (u.shapes and c in cols_named)]
+            ss = list(u.shapes) or [s for s in SHAPES if s not in shp_named]
+            could = set(itertools.product(cs, ss))
+            hit = [k for k in mapping if mapping[k] is not None and _objects(k, uni) & could]
+            for k in hit:
+                drop(k)
+            problems.append({"kind": "unread", "severity": "error", "text": self.text[u.a:u.b].strip(),
+                             "msg": f"'{' '.join(u.unread)}' not understood: no key for it"
+                                    + (f", {', '.join(_kname(k) for k in hit)} dropped (could take those objects)"
+                                       if hit else "")})
+        keys = [e for e in keys if e["key"] in mapping]
+        # a key dropped where a broader one would take its objects: they stay instead (never a guessed bin)
+        for k in dict.fromkeys(dropped):
+            if k == "default":
+                continue
+            if isinstance(k, tuple):                 # keys resolve_bin would fall back to for k's objects
+                broader = [k[0], k[1], "default"]
+            elif k in SHAPES:
+                broader = [c for c in mapping if not isinstance(c, tuple) and _key_colors(c)] + ["default"]
+            else:
+                broader = list(SHAPES) + ["default"]
+            if k not in mapping and any(mapping.get(q) is not None for q in broader):
+                mapping[k] = None
+                keys.append({"key": k, "bin": None, "evidence": "(dropped: stays)", "conf": 1.0})
+        # a shape that stays beats the colour keys for its objects (resolve_bin: the colour would win)
+        for s in [k for k, v in mapping.items() if k in SHAPES and v is None]:
+            for c in [c for c, v in list(mapping.items()) if v is not None and _key_colors(c) and
+                      not isinstance(c, tuple)]:
+                if (c, s) not in mapping:
+                    mapping[(c, s)] = None
+                    keys.append({"key": (c, s), "bin": None, "evidence": "(the shape stays)", "conf": 1.0})
+        cols = {k: v for k, v in mapping.items() if not isinstance(k, tuple) and _key_colors(k) and v is not None}
+        for sh, b in [(k, v) for k, v in mapping.items() if k in SHAPES and v is not None]:
             for c, bc in cols.items():
                 if bc != b and (c, sh) not in mapping:
                     problems.append({"kind": "overlap", "severity": "warning", "text": "",
                                      "msg": f"{c} {sh}s: {c} -> {bc} and {sh} -> {b}; the colour wins"})
-        if not mapping:
+        if not any(v is not None for v in mapping.values()):
             problems.append({"kind": "nothing", "severity": "error", "msg": "no object / bin pair understood",
                              "text": self.text.strip()})
         tup = [k for k in mapping if isinstance(k, tuple)]
@@ -793,7 +1076,8 @@ class _Reader:
 def parse_instruction(text) -> Parse:
     """Instruction text -> Parse (mapping, per-key evidence, problems). See the module docstring."""
     text = text or ""
-    units = _terms(_classify(_tokens(text)))
+    toks = _classify(_tokens(text))
+    units = _terms(toks)
     rd, cur = _Reader(text), []
     for u in units + [Tok("SENT", "\n", "\n", len(text), len(text))]:
         if isinstance(u, Tok) and u.kind == "SENT":
@@ -801,4 +1085,10 @@ def parse_instruction(text) -> Parse:
             cur = []
         else:
             cur.append(u)
-    return rd.result()
+    r = rd.result()
+    for t in toks:
+        if t.kind == "COL":
+            r.words.setdefault(t.val, [])
+            if (t.typo or t.word) not in r.words[t.val]:
+                r.words[t.val].append(t.typo or t.word)
+    return r

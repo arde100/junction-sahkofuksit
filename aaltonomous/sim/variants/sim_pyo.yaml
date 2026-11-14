@@ -1,0 +1,15 @@
+# The organisers' sim with ONLY the object colours and colour words changed: purple / yellow / orange objects, as
+# the organisers say they use ("the cube colors in sim are wrong (red blue yellow). We will use the ones we have
+# (purple, yellow, orange)", Discord 2026-11-14). Robot, boxes, mat and lighting as upstream: this is what a
+# held-out selection sim with corrected colours could look like. The shades are OUR GUESS (see sim_pyo2 for another).
+# Use: docker exec -e AALTO_VARIANT=sim_pyo aalto-b bash -lc "aalto sim"
+name: sim_pyo
+notes: upstream sim, objects rendered orange (internal red) and purple (internal blue), colour words renamed
+
+colors:   # render only; internal names (red / yellow / blue) stay in the task logic and scoring
+  objects:
+    red: [240, 120, 20]     # GUESS: orange, OpenCV H ~14 (the boxes are [230, 110, 30], H 12)
+    yellow: [235, 200, 20]  # = scene.yaml, H 25
+    blue: [110, 50, 160]    # GUESS: purple, H ~136
+
+color_words: {red: orange, blue: purple}

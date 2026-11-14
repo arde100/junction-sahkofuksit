@@ -15,6 +15,10 @@ Per case:
      grasp-point error and the shift (row "corr": err_mm, along / across / up, dq, applied or why not), as the
      policy does it; every case: err_close_* = planned - measured grasp point CLOSE_ERR_TICKS into the close (the
      fingers moving, not yet on the object): the A/B number.
+     Sag feed-forward (config sag, --ff on | off; default the config's sag.enabled, sim profile: on): every tick is
+     sent as intended + the feed-forward offset at the sim prior (fixed here: no online learning, so cases compare);
+     plans, the correction and every error stay in intended space. err_pre_corr_* (with --correct on / dwell) =
+     planned - measured grasp point at the end of the settle, before any shift: what the feed-forward alone achieves.
 The next case is planned in a thread while this one runs (start = this case's retreat pose, object pose predicted
 from its layout entry; planned again if the placed object is elsewhere), so the arm goes DIRECTLY to the next
 pregrasp. Via the previous plan's home tail only if the direct move does not plan, the arm changes, or the hand is
@@ -23,6 +27,8 @@ scene (no placement, motion or settling; only its planning, which normally overl
 
     python -m aaltonomous.sim.grasp_lab --shapes cube,triangle --yaws -45,0,30 --out /data/.../base.jsonl
     python -m aaltonomous.sim.grasp_lab --set '{"hand.closed": [0, -0.1, 1.2, -1.0, -0.6, -1.0, -0.6]}' --label c2
+    python -m aaltonomous.sim.grasp_lab --profile base ... # the classical config's base (real robot) values instead of
+                                                           # ORACLE_OVERRIDES (sim: e.g. AALTO_VARIANT=real_like)
     python -m aaltonomous.sim.grasp_lab --mock ...        # offline mock world: control flow only, no physics
     python -m aaltonomous.sim.grasp_lab --plan-only ...   # which cases plan (no sim, no env)
 (env `isaac`, PYTHONPATH=$REPO; 2nd sim: AALTO_* env vars as in evaluate.py / grasp_test.py)
@@ -191,6 +197,15 @@ class Lab:
         self.correct = (getattr(a, "correct", None) or "on") if cc.get("enabled") else "off"
         self.cplanner = (Planner(cfg, self.scene, self.post, self.home_q, self.mkin, safety, spec)
                          if env is not None and self.correct != "off" else None)
+        # sag feed-forward: planners dry-run the commanded ticks; _step sends them (main-thread kinematics: mkin)
+        from aaltonomous.baselines.classical.sag import SagFF
+        self.ff = SagFF(cfg) if (cfg.get("sag") or {}).get("enabled") else None
+        if self.ff is not None:
+            self.ff.learn = False          # the prior, fixed: cases stay comparable
+            self.planner.ff = self.ff
+            if self.cplanner is not None:
+                self.cplanner.ff = self.ff
+            self.fkin = self.mkin or ArmKinematics(cfg, spec)
         self.perc = oracle.PrivilegedPerception(self.scene, sc) if sc is not None else None
         self.dt = 1.0 / HZ
         self.H = self.scene.object_height()
@@ -204,6 +219,8 @@ class Lab:
         self.job, self.epoch = None, 0
         self.deadline, self._tbase, self._t_case = None, 0.0, 0.0
         self.trace, self.clips, self.clip_reasons = [], 0, set()
+        self._name = self._main_xy = None     # the case object (by name) among the placed ones; its placed xy
+        self._nb0 = {}                         # --neighbour: the other objects' poses after placement
 
     # ------------------------------------------------------------------ clock + stepping
     def _env_t(self):
@@ -219,9 +236,18 @@ class Lab:
         c = self.env.clock
         return c.now() if c is not None else self._tbase + self._env_t()
 
+    def _sent(self, arm, hand):
+        """What goes to the env for intended `arm` (sag feed-forward: + its offset)."""
+        return np.asarray(arm, float) if self.ff is None else self.ff.commanded(self.fkin, arm, hand)
+
+    def _from_filter(self):
+        """(intended arm, hand) of the filter's last command (sag feed-forward: the pose that command yields)."""
+        a, h = self.env.filter.arm_cmd.copy(), self.env.filter.hand_cmd.copy()
+        return (a if self.ff is None else self.ff.intended(self.fkin, a, h)), h
+
     def _step(self, arm, hand):
-        _, info = self.env.step({"arm_q_target": arm, "hand_q_target": hand})
-        self.last = (np.asarray(arm, float).copy(), np.asarray(hand, float).copy())
+        _, info = self.env.step({"arm_q_target": self._sent(arm, hand), "hand_q_target": hand})
+        self.last = (np.asarray(arm, float).copy(), np.asarray(hand, float).copy())   # intended
         if info["clipped"]:
             self.clips += 1
             self.clip_reasons.update(info["clip_reasons"])
@@ -238,7 +264,7 @@ class Lab:
         if self.env.clock is None:
             self._tbase += self._env_t()          # home_arms -> env.reset restarts env._now()
         err = ev.home_arms(self.env, self.sc)
-        self.last = (self.env.filter.arm_cmd.copy(), self.env.filter.hand_cmd.copy())
+        self.last = self._from_filter()
         self.prev, self.epoch = None, self.epoch + 1
         return err
 
@@ -253,7 +279,7 @@ class Lab:
             self.env.reset()
         finally:
             b.reset_scene = orig
-        self.last = (self.env.filter.arm_cmd.copy(), self.env.filter.hand_cmd.copy())
+        self.last = self._from_filter()
 
     def _recover(self):
         """After an error: wait for the planner thread, raise a low hand straight up (checked), home_arms."""
@@ -295,13 +321,26 @@ class Lab:
         return out
 
     # ------------------------------------------------------------------ scene
-    def _obj(self, phase=None, side=None):
+    @staticmethod
+    def _pose(o):
+        yaw, tilt = _yaw_tilt(o.get("quat_xyzw") or [0, 0, 0, 1])
+        return {"p": np.asarray(o["pos"], float), "yaw": yaw, "tilt": tilt, "speed": float(o["speed"])}
+
+    def _obj(self, phase=None, side=None, others=None):
+        """The case's object (the one placed nearest the case position, then followed by name: --neighbour places
+        more); others: dict filled with the other objects' poses by name."""
         objs = [o for o in self.sc.state()["objects"] if o["active"]]
         if not objs:
             return None
-        o = objs[0]
-        yaw, tilt = _yaw_tilt(o.get("quat_xyzw") or [0, 0, 0, 1])
-        s = {"t": self.now(), "p": np.asarray(o["pos"], float), "yaw": yaw, "tilt": tilt, "speed": float(o["speed"])}
+        o = next((o for o in objs if o.get("name") == self._name), None) if self._name else None
+        if o is None:
+            o = objs[0] if self._main_xy is None else min(
+                objs, key=lambda o: np.linalg.norm(np.asarray(o["pos"][:2], float) - self._main_xy))
+            self._name = o.get("name")
+        if others is not None:
+            others.update({q.get("name"): self._pose(q) for q in objs if q is not o})
+        s = {"t": self.now(), **self._pose(o)}
+        tilt = s["tilt"]
         if phase is not None:
             sig = self._sig(side) if side else None
             self.trace.append([_r(s["t"] - self._t_case, 2), phase] + [_r(1000 * v) for v in s["p"]]
@@ -319,12 +358,24 @@ class Lab:
                 return o
 
     def _detect(self, case):
+        """The case object's detection (+ the --xy-error); the other detected objects (--neighbour) go to
+        case["_nb_det"] (planned around if neighbours.enabled)."""
         dets = self.perc.detect()
         if not dets:
             raise RuntimeError("placed object not detected on the counter")
-        d = dets[0]
+        pred = self.scene.mat_to_pelvis([case["x"], case["y"], self.H])[:2]
+        d = min(dets, key=lambda q: np.linalg.norm(q.top[:2] - pred))
+        case["_nb_det"] = [q for q in dets if q is not d]
         d.top = d.top + self._err(case)
         return d
+
+    def _nb_pred(self, case):
+        """Neighbour Detections expected from the case's layout (--neighbour), for planning before placement."""
+        out = []
+        for n in case.get("nb") or []:
+            d = self._det_pred({**n, "rep": 0, "xy_error": (0.0, 0.0)})
+            out.append(d)
+        return out
 
     def _err(self, case):
         e = case.get("xy_error")
@@ -352,8 +403,10 @@ class Lab:
         s0 = "left" if det.top[1] > self.cfg["grasp"]["y_split"] else "right"
         return [s0, "right" if s0 == "left" else "left"]
 
-    def _plan_side(self, det, side, arm, hand):
+    def _plan_side(self, det, side, arm, hand, nbs=None):
         P = self.planner
+        if nbs:   # other objects on the counter: the planner's neighbour rule (only with neighbours.enabled)
+            return P._scoped(nbs, None, self._plan_side, det, side, arm, hand)
         off = np.asarray((self.cfg["grasp"].get("arm_xy_offset") or {}).get(side, [0.0, 0.0]), float)
         kw = {"place_xy": det.top[:2] + off + self.place_off}     # put it down where it was grasped
         if self.a.finger_yaw is not None:
@@ -420,7 +473,9 @@ class Lab:
             need = self.H + 0.01
             opts = []
             if prev is None:
-                how = "home" if np.allclose(start[0], self.home_q, atol=1e-6) else "here"
+                sent = self.planner.commanded(start[0], start[1])   # (home_arms parks the COMMAND at home)
+                how = ("home" if np.allclose(start[0], self.home_q, atol=1e-6) or np.allclose(sent, self.home_q,
+                                                                                             atol=1e-6) else "here")
                 opts = [(how, start, None, s) for s in self._sides(det)]
             else:
                 clr = min(self.planner.clearance(s, *start) for s in ("left", "right"))
@@ -432,8 +487,10 @@ class Lab:
                         opts.append(("direct", start, None, s))
                     if len(ta):
                         opts.append(("via_home", (ta[-1], th[-1]), prev["tail"], s))
+            nbs = case.get("_nb_det")
+            nbs = self._nb_pred(case) if nbs is None else nbs
             for how, (arm, hand), prefix, side in opts:
-                p = self._plan_side(det, side, arm.copy(), hand.copy())
+                p = self._plan_side(det, side, arm.copy(), hand.copy(), nbs)
                 if not p.ok:
                     res["tries"].append(f"{how}/{side}: {p.reason}")
                     continue
@@ -519,8 +576,9 @@ class Lab:
         a = self.a
         return {"type": "case", "label": a.label, "i": i, "shape": c["shape"], "color": c["color"], "yaw": c["yaw"],
                 "x": round(c["x"], 3), "y": round(c["y"], 3), "rep": c["rep"], "arm_req": a.arm,
-                "face_align": a.face_align, "tri_phi": self.cfg["grasp"]["face_align"]["triangle_phi_deg"],
-                "finger_yaw_req": a.finger_yaw,
+                "profile": getattr(a, "profile", None) or "oracle",
+                "face_align": bool(self.cfg["grasp"]["face_align"]["enabled"]), "tri_phi": self.cfg["grasp"]["face_align"]["triangle_phi_deg"],
+                "finger_yaw_req": a.finger_yaw, "ff": self.ff is not None, "correct": self.correct,
                 "xy_error_mm": [_r(1000 * v) for v in self._err(c)[:2]], "hold_s": a.hold, "outcome": None,
                 "plan_ok": None, "plan_reason": "", "error": None}
 
@@ -555,9 +613,13 @@ class Lab:
                     self._step(a_, h_)
                 self.prev = None
             t1 = self.now()
-            self.sc.reset([{"color": case["color"], "shape": case["shape"], "x": case["x"], "y": case["y"],
-                            "yaw": float(np.radians(case["yaw"]))}])
+            self._name, self._main_xy = None, self.scene.mat_to_pelvis([case["x"], case["y"], 0.0])[:2]
+            self.sc.reset([{"color": c["color"], "shape": c["shape"], "x": c["x"], "y": c["y"],
+                            "yaw": float(np.radians(c["yaw"]))} for c in [case] + list(case.get("nb") or [])])
             o0 = self._settle(0.2, 2.0, "settle")
+            self._nb0 = {}
+            if case.get("nb"):
+                self._obj(others=self._nb0)
             det = self._detect(case)
             if self._moved(det, j["det"]):     # e.g. DR pose jitter: plan again for the measured pose
                 row["replanned"] = True
@@ -588,15 +650,18 @@ class Lab:
             row["recovery"] = self._recover()
         return row
 
-    def _sig(self, side):
+    def _sig(self, side, kind="abs7"):
+        """verify.grasp_signal of `side`'s hand now (abs7 = max |measured - commanded|; finger_shortfall = the closing
+        shortfall of the 4 finger joints, the robot's signal)."""
+        from aaltonomous.baselines.classical.verify import grasp_signal
         sl = slice(0, 7) if side == "left" else slice(7, 14)
-        return float(np.abs(self.env.backend.joints()[2][sl] - self.env.filter.hand_cmd[sl]).max())
+        return grasp_signal(self.env.backend.joints()[2][sl], self.env.filter.hand_cmd[sl], kind)
 
     def _gp(self, side, ref=None):
         """(measured, commanded) grasp point (FK of measured / commanded arm_q; ref: this arm_q as the command, e.g.
         the planned tick when the sent one is corrected)."""
         return (self.mkin.grasp_pose(side, self.env.backend.joints()[0])[0],
-                self.mkin.grasp_pose(side, self.env.filter.arm_cmd if ref is None else ref)[0])
+                self.mkin.grasp_pose(side, self.last[0] if ref is None else ref)[0])   # (intended: what was meant)
 
     def _correct(self, j, A, k, row):
         """Settle and correct at body tick k (the blend-in starts here): the measured error (cmd - meas, mm, pelvis
@@ -605,7 +670,7 @@ class Lab:
         side, P, cc = j["plan"].side, self.cplanner, self.cfg["grasp"]["correct"]
         t0 = time.perf_counter()
         arm_q, dq_m, _ = self.env.backend.joints()
-        last_a, last_h = self.env.filter.arm_cmd.copy(), self.env.filter.hand_cmd.copy()
+        last_a, last_h = self.last[0].copy(), self.last[1].copy()     # intended (sag feed-forward: not what was sent)
         from aaltonomous.baselines.classical.policy import ClassicalPolicy
         e, dq, f, res = P.correction_dq(side, last_a, arm_q)
         sl = slice(0, 7) if side == "left" else slice(7, 14)
@@ -626,6 +691,9 @@ class Lab:
                        e[2]]), "dq_max_mrad": _r(1000 * np.abs(dq).max()), "res_mm": _r(1000 * res, 2),
                        "applied": why is None, "why": why,
                        "speed": _r(speed, 3), "ms": _r(1e3 * (time.perf_counter() - t0), 1)}
+        # before any shift: what the sag feed-forward (--ff) alone leaves at the end of the settle (planned - measured)
+        row.update(err_pre_corr_mm=r(e), err_pre_corr_norm_mm=_r(1000 * err),
+                   err_pre_corr_along_across_up_mm=row["corr"]["along_across_up_mm"])
         return out
 
     def _measure(self, j, row, o0):
@@ -658,12 +726,16 @@ class Lab:
             for t in tags:
                 if t in ("descend_end", "pre_close", "close_end"):
                     got[t] = self._gp(side, A0[k])
+                    if t == "pre_close":
+                        self._close_q = self.env.backend.joints()[0].copy()
                 elif t == "sig_1s":     # + signed per-joint residual (LEFT order for the left hand, DDS order right)
                     row["sig_1s"] = _r(self._sig(side), 4)
+                    row["sig_fs_1s"] = _r(self._sig(side, "finger_shortfall"), 4)
                     row["sig_1s_joints"] = [_r(v, 4) for v in self.env.backend.joints()[2][sl]
                                             - self.env.filter.hand_cmd[sl]]
                 elif t == "hold_end":
                     row["sig_hold"] = _r(self._sig(side), 4)
+                    row["sig_fs_hold"] = _r(self._sig(side, "finger_shortfall"), 4)
                     got["gp_hold"] = self._gp(side)[0]
             if tags or k % every == 0 or k == len(A) - 1:
                 o = self._obj(names[k], side)
@@ -672,10 +744,27 @@ class Lab:
                 if k == len(A) - 1:
                     got["retreat_obj"] = o
         row["t_exec"] = _r(self.now() - t_exec, 2)
+        # the arm's joints (deg, LEFT-arm convention: the right arm x kinematics.ARM_MIRROR), planned per phase
+        # (min, max) and measured at the close: what the plan asks of the wrist (W1, real-arm joint ranges)
+        from aaltonomous.baselines.classical.kinematics import ARM_MIRROR
+        mir = 1.0 if side == "left" else ARM_MIRROR
+        row["joints_deg"] = {n: [[_r(v, 0) for v in np.degrees(A0[s:e, sl] * mir).min(0)],
+                                 [_r(v, 0) for v in np.degrees(A0[s:e, sl] * mir).max(0)]]
+                             for n, s, e in j["phases"] if e > s}
+        if "pre_close" in got:
+            row["joints_close_meas_deg"] = [_r(v, 0) for v in np.degrees(self._close_q[sl] * mir)]
         self.prev = {"side": side, "tail": j["tail"]}
         t_post = self.now()
         of = self._settle(0.2, 1.5, "post")
         row["t_post"] = _r(self.now() - t_post, 2)
+        if self._nb0:   # --neighbour: how far the other objects were pushed / tipped by this grasp
+            nb1 = {}
+            self._obj(others=nb1)
+            d = [(float(np.linalg.norm(nb1[n]["p"][:2] - p0["p"][:2])), nb1[n]["tilt"]) for n, p0 in self._nb0.items()
+                 if n in nb1]
+            row["nb_disp_mm"] = _r(1000 * max(x for x, _ in d)) if d else None
+            row["nb_tilt_deg"] = _r(max(t for _, t in d)) if d else None
+            row["nb_planned"] = bool((self.cfg.get("neighbours") or {}).get("enabled"))
 
         rest = o0["p"]
         def rise(o):
@@ -762,12 +851,17 @@ def make_cases(a, scene):
     xs = _floats(a.xs) or [float(v) for v in np.linspace(*L["region_x"], 4)]
     ys = _floats(a.ys) or [float(np.mean(L["region_y"]))]
     colors = itertools.cycle(a.colors.split(","))
+    nbs = [_floats(s) for s in (getattr(a, "neighbour", None) or "").split(";") if s.strip()]
     out = []
     for x, y in itertools.product(xs, ys):
         for shape in a.shapes.split(","):
             for yaw in _floats(a.yaws):
                 for r in range(a.repeats):
-                    out.append({"shape": shape, "color": next(colors), "yaw": yaw, "x": x, "y": y, "rep": r})
+                    c = {"shape": shape, "color": next(colors), "yaw": yaw, "x": x, "y": y, "rep": r}
+                    if nbs:
+                        c["nb"] = [{"shape": a.neighbour_shape, "color": next(colors), "yaw": 0.0,
+                                    "x": x + dx / 1000, "y": y + dy / 1000} for dx, dy in nbs]
+                    out.append(c)
     return out
 
 
@@ -799,7 +893,8 @@ def print_table(rows, out=print):
         groups.setdefault(f"{r['shape']}/{r.get('side') or '-'}", []).append(r)
     executed = any("lifted" in r for r in cs)
     out(f"\n  {'group':16s} {'n':>3s} {'plan':>4s} " + (f"{'lift':>4s} {'held':>4s} {'rel':>4s} {'ok':>4s} "
-        f"{'sig_1s':>7s} {'sim_s':>6s} {'err@close':>9s} {'corr':>4s}" if executed else f"{'exec_plan_s':>11s}"))
+        f"{'sig_1s':>7s} {'sim_s':>6s} {'err@close':>9s} {'corr':>4s} {'pre_corr':>8s}" if executed
+        else f"{'exec_plan_s':>11s}"))
     for k in sorted(groups, key=lambda k: (k.split("/")[0], "/" in k, k)):
         g = groups[k]
         n = lambda f: sum(bool(r.get(f)) for r in g)
@@ -810,10 +905,12 @@ def print_table(rows, out=print):
         sig = [r["sig_1s"] for r in g if r.get("lifted") and r.get("sig_1s") is not None]
         sim = [r["sim_s"] for r in g if r.get("sim_s") is not None]
         ec = [r["err_close_norm_mm"] for r in g if r.get("err_close_norm_mm") is not None]
+        pc = [r["err_pre_corr_norm_mm"] for r in g if r.get("err_pre_corr_norm_mm") is not None]
         out(f"  {k:16s} {len(g):3d} {n('plan_ok'):4d} {n('lifted'):4d} {n('held'):4d} {n('released'):4d} "
             f"{sum(r.get('outcome') == 'ok' for r in g):4d} {np.mean(sig) if sig else float('nan'):7.3f} "
             f"{np.mean(sim) if sim else float('nan'):6.1f} {np.mean(ec) if ec else float('nan'):9.1f} "
-            f"{sum(bool((r.get('corr') or {}).get('applied')) for r in g):4d}")
+            f"{sum(bool((r.get('corr') or {}).get('applied')) for r in g):4d} "
+            f"{np.mean(pc) if pc else float('nan'):8.1f}")
     bad = [r for r in cs if r.get("outcome") not in ("ok", None)]
     if bad:
         out("  failed cases:")
@@ -826,18 +923,36 @@ def print_table(rows, out=print):
 
 
 def build_cfg(a):
-    """ORACLE_OVERRIDES + --face-align / --tri-phi (grasp.face_align.enabled / .triangle_phi_deg; the oracle's default
-    phi: $AALTO_TRI_PHI or the sim profile's) + --set (dotted keys, applied last) through load_config."""
+    """--profile oracle (default): ORACLE_OVERRIDES + --face-align / --tri-phi (grasp.face_align.enabled /
+    .triangle_phi_deg; the oracle's default phi: $AALTO_TRI_PHI or the sim profile's) + --set (dotted keys, applied
+    last) through load_config. --profile base: the classical config's BASE values (the robot profile, `none`) instead
+    of ORACLE_OVERRIDES; --profile <name>: that config profile (profiles.<name>); the flags then override the
+    profile's values only where given (--face-align / --no-face-align, --tri-phi, --correct, --ff), --set last."""
     from aaltonomous.baselines.classical.config import load_config
     from aaltonomous.sim import oracle
     user = json.loads(a.set) if a.set else {}
     for k, v in user.items():
         if k.startswith("hand.") and k != "hand.right" and len(v) != 7:
             raise ValueError(f"{k}: a hand posture has 7 values (LEFT order), got {len(v)}")
+    prof = getattr(a, "profile", None) or "oracle"
+    if prof != "oracle":
+        ov = {}
+        if a.face_align is not None:
+            ov["grasp.face_align.enabled"] = bool(a.face_align)
+        if getattr(a, "correct", None):
+            ov["grasp.correct.enabled"] = a.correct != "off"
+        if getattr(a, "ff", None):
+            ov["sag.enabled"] = a.ff == "on"
+        if a.tri_phi is not None:
+            ov["grasp.face_align.triangle_phi_deg"] = float(a.tri_phi)
+        ov.update(user)
+        return load_config(profile="none" if prof == "base" else prof, overrides=ov), user
     ov = dict(oracle.ORACLE_OVERRIDES)
-    ov["grasp.face_align.enabled"] = bool(a.face_align)
+    ov["grasp.face_align.enabled"] = True if a.face_align is None else bool(a.face_align)
     if getattr(a, "correct", None):
         ov["grasp.correct.enabled"] = a.correct != "off"
+    if getattr(a, "ff", None):
+        ov["sag.enabled"] = a.ff == "on"
     if a.tri_phi is not None:
         ov["grasp.face_align.triangle_phi_deg"] = float(a.tri_phi)
     ov.update(user)
@@ -854,15 +969,29 @@ def parser():
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--arm", default="auto", choices=["auto", "left", "right"],
                     help="auto: object side first, then the other")
-    ap.add_argument("--set", default=None, help="JSON {dotted.key: value} over ORACLE_OVERRIDES (hand.* = LEFT order)")
-    ap.add_argument("--face-align", action=argparse.BooleanOptionalAction, default=True,
-                    help="cube/triangle: oracle face-aligned finger direction (else stock finger hints only)")
+    ap.add_argument("--profile", default="oracle",
+                    help="configuration: oracle (default) = ORACLE_OVERRIDES (the sim profile's grasp, pinned); base = "
+                         "the classical config's base values (the real robot's profile, `none`); any other name = "
+                         "that config profile")
+    ap.add_argument("--set", default=None, help="JSON {dotted.key: value} over the --profile configuration "
+                                                "(hand.* = LEFT order)")
+    ap.add_argument("--face-align", action=argparse.BooleanOptionalAction, default=None,
+                    help="cube/triangle: oracle face-aligned finger direction (else stock finger hints only); "
+                         "default: on with --profile oracle, the profile's grasp.face_align.enabled otherwise")
     ap.add_argument("--tri-phi", type=float, default=None,
                     help="deg, finger direction vs triangle apex (oracle default: AALTO_TRI_PHI or the sim profile's triangle_phi_deg)")
     ap.add_argument("--finger-yaw", type=float, default=None, help="deg, force the finger direction (pelvis frame)")
     ap.add_argument("--correct", default=None, choices=["on", "off", "dwell"],
                     help="settle and correct (grasp.correct): on = shift applied, off = no settle phase (plan as "
                          "before), dwell = settle phase + measurement, no shift; default: the config's grasp.correct")
+    ap.add_argument("--ff", default=None, choices=["on", "off"],
+                    help="sag feed-forward (config sag, the sim prior fixed): every tick sent as intended + the "
+                         "gravity-sag offset; default: the config's sag.enabled (oracle / sim profile: on)")
+    ap.add_argument("--neighbour", default=None, metavar="DX,DY[;DX,DY]",
+                    help="mm, MAT frame (x = to the robot's left, y = away from it): place another object (yaw 0) "
+                         "this far from every case object; rows get nb_disp_mm / nb_tilt_deg (how far the grasp "
+                         "pushed / tipped it). Planned around only with neighbours.enabled (--set)")
+    ap.add_argument("--neighbour-shape", default="cube")
     ap.add_argument("--xy-error", default="0,0", help="DX,DY mm added to the detected top centre (pelvis frame)")
     ap.add_argument("--place-offset", default="0,0", help="DX,DY mm: put down here relative to the grasp point")
     ap.add_argument("--hold", type=float, default=1.5, help="s at carry height")
@@ -913,7 +1042,8 @@ def main(argv=None):
         meta = {"label": a.label, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "argv": sys.argv[1:] if argv is None
                 else list(argv), "set": user, "args": vars(a),
                 "tri_phi": cfg["grasp"]["face_align"]["triangle_phi_deg"], "sim": info, "dr_params": dr,
-                "n_cases": len(cases), "cfg": {k: cfg[k] for k in ("grasp", "hand", "motion", "ik")}}
+                "n_cases": len(cases), "profile": a.profile,
+                "cfg": {k: cfg[k] for k in ("grasp", "hand", "motion", "ik", "sag", "verify", "home_arm_q")}}
         lab.run(cases, a.out, meta)
     finally:
         if env is not None:

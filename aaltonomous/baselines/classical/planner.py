@@ -40,6 +40,15 @@ triangle at triangle_phi_deg from an apex, from Detection.shape / yaw, gated by 
 Drop slots (grasp.slots): per (bin, arm) a few release points inside the bin (rows along the near wall, reach-tested,
 spaced as far apart as the footprint allows); drop_slot() takes the one farthest from drop_used[bin] (the policy's
 delivered objects / the oracle's objects in the bin). Off: grasp.drop_offsets as before.
+Boxes (self.boxes, bins.Boxes; set_boxes: the perception's detected ones, perception.boxes.mode on): every box geometry
+above (drop point, slots in the yawed inner footprint, carry / drop height from the rims, rim clearances, reach tests)
+comes from them; a box that is not ok (not found, name uncertain) gets no plan ("<bin> box not found"). Cached slots
+and reach tests are redone when their box moved by more than grasp.slots.box_tol.
+Sag feed-forward (config sag, Planner.ff = the policy's sag.SagFF): every plan, IK target and clearance is in INTENDED
+joint space; what the policy sends is commanded() = intended + the feed-forward offset at the gain applied now (it does
+not change while a plan is planned or executed). So the safety dry run (dry_run_safety: joint limits, speed, workspace
+box, counter keep-out) runs on the commanded ticks, and every time-scaled move (_timed) is slowed where the commanded
+ticks would exceed sag.max_cmd_vel (the offset's own speed adds G * d tau / dt). Off (ff None / disabled): unchanged.
 """
 from __future__ import annotations
 
@@ -51,6 +60,9 @@ import numpy as np
 from aaltonomous.interface.safety import JointSpec, SafetyConfig, SafetyFilter
 from aaltonomous.interface.tasks import FIXED_MAPPING
 
+from .bins import Boxes
+from .config import fixed_mapping
+from .far import FarDelivery
 from .instruction import object_bin
 from .kinematics import ARM_MIRROR, ArmKinematics, cylinder_distance
 
@@ -84,6 +96,7 @@ class Plan:
     nb: np.ndarray | None = None                       # neighbour cylinders it was checked against (x, y, r, top z)
     least_bad: bool = False                            # accepted by the least-bad rule (neighbours.floor)
     face: float | None = None                          # face-aligned grasp: finger direction (deg, pelvis)
+    far: dict | None = None                            # grasp.far release (far.py): pose, predicted landing, margins
 
     @property
     def duration(self):
@@ -110,6 +123,10 @@ class Plan:
         nb = "" if self.nb_clear is None else f"  neighbours >= {1000 * self.nb_clear:.0f}mm"
         nb += " (LEAST-BAD)" if self.least_bad else ""
         face = "" if self.face is None else f" face {self.face:.0f}deg"
+        if self.far is not None:   # grasp.far: release height above the counter, landing margin to the near wall
+            face += (f" FAR release z+{100 * self.far['z']:.0f}cm tilt {self.far['tilt_deg']:.0f}deg margin "
+                     f"{1000 * self.far['margin']:.0f}mm side {1000 * self.far['margin_side']:.0f}mm"
+                     + (" MARGINAL" if self.far.get("marginal") else ""))
         return (f"{self.color:<6} {self.side:<5} arm -> {self.target_bin} bin  {wp}  IK ok max_err={err:.1f}mm "
                 f"max_tilt={tilt:.0f}deg{face}  {self.duration:.1f}s{nb}  safety_clips={self.safety_clips}")
 
@@ -242,7 +259,8 @@ class Planner:
         self.safety = safety or SafetyConfig(dt=dt)
         self.dt = dt
         self.height = float(cfg["perception"].get("object_height") or scene.object_height())
-        self.mapping = mapping or dict(FIXED_MAPPING)  # plan() without bin_name only (the policies pass the bin)
+        # plan() without bin_name only (the policies pass the bin): the config's fixed mapping, plus the sim's words
+        self.mapping = mapping or {**FIXED_MAPPING, **fixed_mapping(cfg)}   # for direct callers (tests, tools)
         self.drop_offsets = {}  # bin -> (dx, dy) pelvis offset of the release point (set per object by the policy)
         self.drop_used = {}     # grasp.slots: bin -> [pelvis xy] of objects delivered there (set by the policy)
         self._drop_avoid = []   # plan_side(drop_avoid=...): more points to keep away from (the first plan of a pair)
@@ -253,25 +271,119 @@ class Planner:
         self._dry = None        # SafetyFilter reused by dry_run_safety (building one loads the URDF)
         self._clear = None      # two_arm.clear_poses as (14,) vectors (clear_poses())
         self._asides = {}       # evade: (side, start, hand, clear pose) -> checked moves aside / back
+        self.ff = None          # sag.SagFF (set by the policy): commanded = intended + gravity-sag feed-forward
+        self.boxes = Boxes.from_scene(scene)   # the boxes every geometry check uses (set_boxes: detected ones)
+        self._slot_box = {}     # (bin, side) -> the Box its cached slots were made for
+        self._slot_old = []     # slots of earlier box poses: ((bin, side), Box, slots) (a box may come back)
+        self._reach_box = {}    # (side, bin) -> the Box its reach test was made for
+        self.far = FarDelivery(self)   # grasp.far (far.py): detected boxes without a reachable drop slot
+        self.far_alt = 0               # far.release(alt=...) of the next plans (the policy: a retry after a short miss)
+
+    def set_boxes(self, boxes):
+        """Use these boxes (bins.Boxes: perception.boxes.mode on) from now on. Cached slots / reach tests are checked
+        against the box they were made for when used (slots(), _reaches_bin): recomputed if it moved by more than
+        grasp.slots.box_tol."""
+        self.boxes = boxes
+
+    def box_ok(self, name):
+        """A box to deliver into: known (scene) or detected with a certain name."""
+        return self.boxes.ok(name)
+
+    def can_deliver(self, name, side):
+        """(ok, how) grasp.far on (robot profile): can `side`'s arm deliver into box `name` at all: a drop slot in
+        reach ('slot'), else a far release that fits (far.reachable). Cached with the slots / reach envelope (per box
+        pose): milliseconds once computed. far off: (True, 'unchecked')."""
+        if not self.far.on():
+            return True, "unchecked"
+        if not self.box_ok(name):
+            return False, f"{name} box not found"
+        if not self.slots_on() or len(self.slots(name, side)):
+            return True, "slot"
+        ok, why = self.far.applies(name, side)
+        if not ok:
+            return False, f"no drop slot in reach, no far release ({why})"
+        return self.far.reachable(name, side)
+
+    def grasp_in_reach(self, det):
+        """Cheap test (one IK per arm): can some arm put its grasp point top-down at det's grasp height? (The full
+        plan searches every finger direction and relocation spot: tens of seconds for an object out of reach.)"""
+        g = self.cfg["grasp"]
+        p = np.r_[det.top[:2], self.scene.counter_z + g["height_frac"] * self.height]
+        return any(self.kin.solve(s, p, self.home)[1] for s in ("left", "right"))
+
+    def box_grade(self, name):
+        """'sure' | 'marginal' | None: the best delivery any arm has into box `name` (can_deliver; marginal = the far
+        release only short of the near rule, far.max_short). far off: 'sure'."""
+        hows = [h for ok, h in (self.can_deliver(name, s) for s in ("left", "right")) if ok]
+        return None if not hows else "marginal" if all("marginal" in h for h in hows) else "sure"
+
+    def box_reachable(self, name):
+        """(ok, why) some arm can deliver into box `name` (can_deliver); why = the arms' reasons when not."""
+        res = [(s, *self.can_deliver(name, s)) for s in ("left", "right")]
+        if any(ok for _, ok, _ in res):
+            return True, ""
+        return False, "; ".join(f"{s}: {how}" for s, _, how in res)
+
+    def _moved(self, a, b):
+        """Box a vs b beyond grasp.slots.box_tol (m, deg, m: centre / size, yaw, rim); a None (slots set by hand,
+        the oracle's copy): never."""
+        tol = (self.cfg["grasp"].get("slots") or {}).get("box_tol") or [0.005, 1.0, 0.005]
+        return a is not None and a.moved(b, tol[0], tol[1], tol[2])
+
+    # ------------------------------------------------------------------ sag feed-forward (config sag)
+    def ff_on(self):
+        return self.ff is not None and self.ff.on
+
+    def commanded(self, arm, hand):
+        """What the policy sends for intended arm ticks (T, 14) / (14,) with hand: + the sag feed-forward offset at
+        the applied gain (this planner's kinematics instance: its thread). Off: arm itself."""
+        if not self.ff_on():
+            return np.asarray(arm, float)
+        return self.ff.commanded(self.kin, arm, hand)
+
+    def _timed(self, Qs, vmax, amax, hand, base=None, sl=None):
+        """time_scale(Qs, vmax, amax) whose commanded ticks (sag feed-forward) keep every joint <= sag.max_cmd_vel:
+        the offset is a function of the pose, so slowing the path by r scales its speed by r too (vmax * r,
+        amax * r^2: the same profile, stretched). Qs rows (14,), or one arm's (7,) inside `base` (14,) at `sl`; hand
+        (14,): held during the move (a hand moving meanwhile changes the arm torque by < 0.1 %)."""
+        a = time_scale(Qs, vmax, amax, self.dt)
+        if not self.ff_on() or not len(a):
+            return a
+        Qs = np.asarray(Qs, float)
+
+        def full(X):
+            if sl is None:
+                return X
+            F = np.repeat(np.asarray(base, float)[None], len(X), 0)
+            F[:, sl] = X
+            return F
+        cap = self.ff.cap
+        for _ in range(6):
+            c = self.commanded(full(np.vstack([Qs[0][None], a])), hand)
+            v = float(np.abs(np.diff(c, axis=0)).max()) / self.dt
+            if v <= cap + 1e-9:
+                return a
+            r = 0.998 * cap / v
+            vmax, amax = vmax * r, amax * r * r
+            a = time_scale(Qs, vmax, amax, self.dt)
+        return a
 
     # ------------------------------------------------------------------ geometry helpers
     def bin_xy(self, name):
-        return self.scene.mat_to_pelvis(np.r_[self.scene.cfg["bins"]["centers"][name], 0.0])[:2]
+        return np.asarray(self.boxes[name].c, float)
 
     def drop_xy(self, name, offset=True):
         """Release point (pelvis xy) in bin `name`: the point of the inner footprint nearest the pelvis, `grasp.drop_inset`
         inside the inner walls (the published box row puts the box centres past the arm's reach). None -> centre.
-        offset: + drop_offsets[name], so the next object does not land on top of the previous one."""
+        offset: + drop_offsets[name], so the next object does not land on top of the previous one. (Box frame: a
+        yawed box keeps the inset from its own walls.)"""
         inset = self.cfg["grasp"].get("drop_inset")
-        c = self.bin_xy(name)
+        bx = self.boxes[name]
         if inset is None:
-            out = c
+            out = self.bin_xy(name)
         else:
-            lo, hi = self.scene.bin_inner_box(name)
-            a, b = self.scene.mat_to_pelvis(np.r_[lo[:2], 0.0])[:2], self.scene.mat_to_pelvis(np.r_[hi[:2], 0.0])[:2]
-            lo2 = np.minimum(np.minimum(a, b) + inset, c)
-            hi2 = np.maximum(np.maximum(a, b) - inset, c)
-            out = np.clip(np.zeros(2), lo2, hi2)
+            h = np.maximum(bx.inner - inset, 0.0)
+            out = bx.pelvis(np.clip(bx.local(np.zeros(2)), -h, h))
         if offset and name in self.drop_offsets:
             out = out + np.asarray(self.drop_offsets[name], float)
         return out
@@ -285,14 +397,24 @@ class Planner:
         its own side), so the first look does not pay for the reach tests."""
         if self.slots_on():
             for b in self.scene.bin_names:
+                if not self.box_ok(b):
+                    continue
                 y = self.bin_xy(b)[1]
                 for side in (("left", "right") if abs(y) <= 0.1 else ("left" if y > 0 else "right",)):
                     self.slots(b, side)
 
     def slots(self, name, side):
-        """Drop slots of bin `name` for arm `side`: pelvis xy (k, 2), in preference order (see _make_slots)."""
-        key = (name, side)
+        """Drop slots of bin `name` for arm `side`: pelvis xy (k, 2), in preference order (see _make_slots). Made for
+        the current box (self.boxes); if it moved since, the slots of an earlier pose within tolerance, else new."""
+        key, bx = (name, side), self.boxes[name]
+        if key in self._slots and self._moved(self._slot_box.get(key), bx):
+            self._slot_old = self._slot_old[-7:] + [(key, self._slot_box.pop(key), self._slots.pop(key))]
+            for o in self._slot_old[::-1]:
+                if o[0] == key and not self._moved(o[1], bx):
+                    self._slots[key], self._slot_box[key] = o[2], o[1]
+                    break
         if key not in self._slots:
+            self._slot_box[key] = bx
             # reach-tested with the default finger direction: computed lazily inside a face-aligned candidate (its
             # direction forced with hint_weight) the IK above the bin tilts and NO slot passes, cached for good
             saved = (self.kin.hint, self.kin.w_hint)
@@ -305,14 +427,15 @@ class Planner:
                 self.kin.hint, self.kin.w_hint = saved
         return self._slots[key]
 
-    def _slot_reach(self, side, xy):
+    def _slot_reach(self, side, xy, wall=None):
         """Can `side` hold its grasp point top-down (tilt <= slots.max_tilt_deg) over xy at carry and at drop
-        height (IK from home, no random restarts: the plan's own IK starts from a nearby pose)?"""
+        height (IK from home, no random restarts: the plan's own IK starts from a nearby pose)? wall: the box's rim
+        height (default: the highest rim)."""
         sc, g = self.scene, self.cfg["grasp"]
-        wall = float(sc.cfg["bins"]["wall_height"])
+        wall = self.boxes.max_rim() if wall is None else float(wall)
         zc, tilt = sc.counter_z, np.radians(float(g["slots"].get("max_tilt_deg", 10.0)))
-        q1, ok1, _, t1 = self.kin.solve(side, np.r_[xy, zc + max(g["carry_height"], wall + self.height + 0.03)],
-                                        self.home, restarts=False)
+        q1, ok1, _, t1 = self.kin.solve(side, np.r_[xy, zc + max(g["carry_height"], self.boxes.max_rim() + self.height
+                                                              + 0.03)], self.home, restarts=False)
         if not ok1 or t1 > tilt:
             return False
         _, ok2, _, t2 = self.kin.solve(side, np.r_[xy, zc + wall + self.height / 2 + g["drop_above_rim"]], q1,
@@ -325,27 +448,30 @@ class Planner:
         _slot_reach holds), 1 + floor(extent / min_spacing) points spread evenly over it. Row r > 0: the midpoints of
         row r-1 (staggered), min_spacing from them diagonally, kept where reachable. Order: greedy farthest-first,
         starting at the row-0 end nearest the stock drop point (centre bin: the end on the arm's own side), capped at
-        slots.count. Empty if nothing is reachable (drop_slot then uses the stock drop point)."""
+        slots.count. Empty if nothing is reachable (drop_slot then uses the stock drop point). In the box frame
+        (x = depth u, y = along the row v): a yawed box's slots keep wall_clear from its own walls."""
         s = self.cfg["grasp"]["slots"]
-        lo, hi = self.scene.bin_inner_box(name)
-        a, b = self.scene.mat_to_pelvis(np.r_[lo[:2], 0.0])[:2], self.scene.mat_to_pelvis(np.r_[hi[:2], 0.0])[:2]
+        bx = self.boxes[name]
         wc, sp = float(s.get("wall_clear", 0.04)), float(s.get("min_spacing", 0.06))
-        (x0, y0), (x1, y1) = np.minimum(a, b) + wc, np.maximum(a, b) - wc
+        (x0, y0), (x1, y1) = -bx.inner + wc, bx.inner - wc
         if x0 > x1 or y0 > y1:
             return np.empty((0, 2))
-        nom = self.drop_xy(name, offset=False)
+        nom = bx.local(self.drop_xy(name, offset=False))
         yn = float(np.clip(nom[1], y0, y1))
-        if not self._slot_reach(side, (x0, yn)):
+
+        def reach(x, y):
+            return self._slot_reach(side, bx.pelvis(np.array([x, y])), bx.rim)
+        if not reach(x0, yn):
             return np.empty((0, 2))
         ends = []
         for ye in (y0, y1):        # reachable extent of row 0: bisect each end towards the nominal point
             good, bad = yn, ye
-            if self._slot_reach(side, (x0, ye)):
+            if reach(x0, ye):
                 good = ye
             else:
                 for _ in range(4):
                     m = 0.5 * (good + bad)
-                    good, bad = (m, bad) if self._slot_reach(side, (x0, m)) else (good, m)
+                    good, bad = (m, bad) if reach(x0, m) else (good, m)
             ends.append(good)
         k = 1 + int(np.floor((ends[1] - ends[0]) / sp + 1e-9))
         rows = [[(x0, y) for y in (np.linspace(ends[0], ends[1], k) if k > 1 else [yn])]]
@@ -354,11 +480,13 @@ class Planner:
             ys = [0.5 * (p[1] + q[1]) for p, q in zip(prev, prev[1:])] or [prev[0][1]]
             half = 0.5 * (prev[1][1] - prev[0][1]) if len(prev) > 1 else 0.0
             x = prev[0][0] + np.sqrt(max(sp * sp - half * half, 0.0))
-            row = [(x, y) for y in ys if x <= x1 and self._slot_reach(side, (x, y))]
+            row = [(x, y) for y in ys if x <= x1 and reach(x, y)]
             if not row:
                 break
             rows.append(row)
-        pts = [np.array(p, float) for r in rows for p in r]
+        pts = [bx.pelvis(np.array(p, float)) for r in rows for p in r]
+        rows = [[tuple(bx.pelvis(np.array(p, float))) for p in r] for r in rows]
+        nom = bx.pelvis(nom)
         sgn = 1.0 if side == "left" else -1.0
         e = [rows[0][0], rows[0][-1]]
         seed = min(range(2), key=lambda i: (round(np.linalg.norm(np.subtract(e[i], nom)), 3), -sgn * e[i][1]))
@@ -403,6 +531,9 @@ class Planner:
             top = np.asarray(getattr(o, "top", o), float)
             shape = getattr(o, "shape", None)
             r = sc.object_dims(shape)["circumradius"] if shape in ("cube", "cylinder", "triangle") else rmax
+            if getattr(o, "lying", False):     # on a side: half the diagonal of its footprint (side x length)
+                d = sc.object_dims(shape)
+                r = float(np.hypot(d["side"] if shape == "triangle" else d["width"], d["height"])) / 2
             rows.append([top[0], top[1], r, sc.counter_z + sc.object_height(shape)])
             tags.append(f"{getattr(o, 'color', 'object')}({top[0]:+.3f},{top[1]:+.3f})")
         return np.array(rows, float).reshape(-1, 4), tags
@@ -480,15 +611,11 @@ class Planner:
         if margin is None:
             margin = self.cfg["motion"].get("bin_margin")
             margin = 0.01 if margin is None else float(margin)
-        pm = self.scene.pelvis_to_mat(pts)
-        b = self.scene.cfg["bins"]
-        half = np.asarray(b["outer_size"], float) / 2 + margin
-        rim = self.scene.counter_z + float(b["wall_height"])
         out = np.inf
-        for c in b["centers"].values():
-            over = np.all(np.abs(pm[:, :2] - np.asarray(c, float)) <= half, axis=1)
+        for bx in self.boxes.all():
+            over = bx.inside(pts[:, :2], margin)
             if over.any():
-                out = min(out, float((pts[over, 2] - rim).min()))
+                out = min(out, float((pts[over, 2] - (self.scene.counter_z + bx.rim)).min()))
         return out
 
     def clearance(self, side, arm_q, hand_q, fingers_only=False):
@@ -511,13 +638,11 @@ class Planner:
         over = np.all((pm[..., :2] >= mat / 2 - size / 2) & (pm[..., :2] <= mat / 2 + size / 2), axis=-1)
         cc = np.where(over, P[..., 2] - self.scene.counter_z, np.inf).min(-1)
         margin = self.cfg["motion"].get("bin_margin")
-        b = self.scene.cfg["bins"]
-        half = np.asarray(b["outer_size"], float) / 2 + (0.01 if margin is None else float(margin))
-        rim_z = self.scene.counter_z + float(b["wall_height"])
+        margin = 0.01 if margin is None else float(margin)
         bb = np.full(len(P), np.inf)
-        for ctr in b["centers"].values():
-            ov = np.all(np.abs(pm[..., :2] - np.asarray(ctr, float)) <= half, axis=-1)
-            bb = np.minimum(bb, np.where(ov, P[..., 2] - rim_z, np.inf).min(-1))
+        for bx in self.boxes.all():
+            ov = bx.inside(P[..., :2], margin)
+            bb = np.minimum(bb, np.where(ov, P[..., 2] - (self.scene.counter_z + bx.rim), np.inf).min(-1))
         return cc, (bb if rim is None else np.where(rim, bb, np.inf))
 
     def tick_rules(self, phases, T, place=False):
@@ -599,7 +724,7 @@ class Planner:
         """lift -> above_bin: Cartesian, else joint space (grasp point above z_drop). motion.joint_carry_first: joint
         space first (usually the shorter joint path), grasp point above the bin drop height (also for a relocation)."""
         if self.cfg["motion"].get("joint_carry_first"):
-            wall = float(self.scene.cfg["bins"]["wall_height"])
+            wall = self.boxes.max_rim()
             z_min = self.scene.counter_z + wall + self.height / 2 + self.cfg["grasp"]["drop_above_rim"]
             reason = plan.reason
             out = self._joint_carry(side, q0, p0, p1, z_min, "carry", plan)
@@ -608,6 +733,24 @@ class Planner:
             plan.reason = reason
         return (self._cartesian(side, p0, p1, q0, "carry", plan)
                 or self._joint_carry(side, q0, p0, p1, z_drop, "carry", plan))
+
+    def _far_carry(self, side, q_from, q_to, z_min, plan):
+        """grasp.far: joint-space move to the far release pose q_to (direct, else via a raised top-down
+        midpoint), accepted if the grasp point never dips below z_min on the way."""
+        def low(qa, qb):
+            return any(self.kin.grasp_pose(side, qa + f * (qb - qa))[0][2] < z_min for f in np.linspace(0, 1, 15))
+        def bulky(qs):   # (far.wrist_clear: the real wrists carry a camera bracket)
+            return self.far.bulk_low(side, [a + f * (b - a) for a, b in zip([q_from] + qs[:-1], qs)
+                                            for f in np.linspace(0, 1, 8)]) < float(self.far.c["wrist_clear"])
+        if not low(q_from, q_to) and not bulky([q_to]):
+            return [q_to]
+        p0, p1 = self.kin.grasp_pose(side, q_from)[0], self.kin.grasp_pose(side, q_to)[0]
+        for dz in (0.06, 0.12):
+            q_mid, ok = self._ik(side, 0.5 * (p0 + p1) + [0, 0, dz], q_from, "far_mid", plan)
+            if ok and not low(q_from, q_mid) and not low(q_mid, q_to) and not bulky([q_mid, q_to]):
+                return [q_mid, q_to]
+        plan.reason = "far carry: no joint-space path above the bin rims"
+        return None
 
     def _joint_carry(self, side, q_from, p_from, p_to, z_min, name, plan):
         """Joint-space move to an IK solution at p_to (direct, else via a raised midpoint), accepted if the grasp
@@ -659,6 +802,11 @@ class Planner:
         last = Plan(False, color=det.color, reason=f"no bin for {det.color} {getattr(det, 'shape', None) or 'object'}")
         if bin_name is None:
             return last
+        if bin_name in self.boxes and not self.box_ok(bin_name):   # (no relocation either: it could not finish)
+            return Plan(False, color=det.color, reason=f"{bin_name} box not found")
+        reach = self.box_reachable(bin_name) if bin_name in self.boxes else (True, "")
+        if not reach[0]:   # grasp.far on: no arm can deliver into it (cached per box pose: cheap)
+            return Plan(False, color=det.color, reason=f"{bin_name} box out of reach ({reach[1]})")
         variant = int(variant)
         sides = (side0, "right" if side0 == "left" else "left")
         if centre and variant % 2:
@@ -905,11 +1053,12 @@ class Planner:
         """(reason | None, move to q7, move back) of `side`'s arm from arm_q (joint space, motion limits, hand_q
         held): every tick's hand points keep motion.counter_clearance over the counter and clear the bin rims."""
         sl = ArmKinematics.sl(side)
-        key = (side, arm_q[sl].tobytes(), hand_q[sl].tobytes(), np.asarray(q7, float).tobytes())
+        key = (side, arm_q[sl].tobytes(), hand_q[sl].tobytes(), np.asarray(q7, float).tobytes(),
+               self.ff.version if self.ff_on() else None)   # (timed at the applied feed-forward gain)
         if key not in self._asides:
             mo = self.cfg["motion"]
-            a1 = time_scale([arm_q[sl], q7], mo["arm_max_vel"], mo["arm_max_acc"], self.dt)
-            a2 = time_scale([q7, arm_q[sl]], mo["arm_max_vel"], mo["arm_max_acc"], self.dt)
+            a1 = self._timed([arm_q[sl], q7], mo["arm_max_vel"], mo["arm_max_acc"], hand_q, arm_q, sl)
+            a2 = self._timed([q7, arm_q[sl]], mo["arm_max_vel"], mo["arm_max_acc"], hand_q, arm_q, sl)
             bad = None if len(a1) else "already there"
             for k, q in enumerate(np.vstack([a1, a2]) if len(a1) else ()):
                 full = arm_q.copy()
@@ -969,17 +1118,25 @@ class Planner:
         """Cheap reach test (cached per planner): can this arm put its grasp point above the bin at carry height at
         all? A cross-body attempt otherwise spends 10-30 s in the joint-space carry search before it fails."""
         key = (side, bin_name)
-        if key not in self._reach:
+        if key not in self._reach or self._moved(self._reach_box.get(key), self.boxes[bin_name]):
             g, sc = self.cfg["grasp"], self.scene
-            z = sc.counter_z + max(g["carry_height"], float(sc.cfg["bins"]["wall_height"]) + self.height + 0.03)
+            z = sc.counter_z + max(g["carry_height"], self.boxes.max_rim() + self.height + 0.03)
             xy = self.drop_xy(bin_name, offset=False)
             self._reach[key] = bool(self.kin.solve(side, np.r_[xy, z], self.home)[1])
+            self._reach_box[key] = self.boxes[bin_name]
         return self._reach[key]
 
     def _reach_reject(self, det, side, bin_name, place_xy=None):
-        """Failed Plan if grasp.reach_check is on and `side` cannot reach bin `bin_name` (not for a counter place)."""
-        if (self.cfg["grasp"].get("reach_check") and place_xy is None and bin_name in self.scene.cfg["bins"]["centers"]
-                and not self._reaches_bin(side, bin_name)):
+        """Failed Plan if bin `bin_name` is not a box to deliver into (box_ok: not found, name uncertain), or if
+        grasp.reach_check is on and `side` cannot reach it (not for a counter place)."""
+        if place_xy is None and bin_name in self.boxes and not self.box_ok(bin_name):
+            return Plan(False, side=side, color=det.color, reason=f"{bin_name} box not found")
+        if place_xy is None and bin_name in self.boxes:   # grasp.far on: this arm cannot deliver there (cheap)
+            ok, how = self.can_deliver(bin_name, side)
+            if not ok:
+                return Plan(False, side=side, color=det.color, reason=f"{side} arm cannot reach the {bin_name} box ({how})")
+        if (self.cfg["grasp"].get("reach_check") and place_xy is None and bin_name in self.boxes
+                and not self.far.on() and not self._reaches_bin(side, bin_name)):   # (far on: can_deliver above)
             return Plan(False, side=side, color=det.color, reason=f"{side} arm cannot reach the {bin_name} bin")
         return None
 
@@ -991,6 +1148,8 @@ class Planner:
         det.shape_conf < min_conf (camera: a weak fit gets the stock hints)."""
         fa = self.cfg["grasp"].get("face_align") or {}
         shape, yaw = getattr(det, "shape", None), getattr(det, "yaw", None)
+        if getattr(det, "lying", False):
+            return self.lying_dirs(det, side, variant)
         if (not fa.get("enabled") or yaw is None or shape not in ("cube", "triangle") or not fa.get(shape, True)
                 or float(getattr(det, "shape_conf", 0.0)) < float(fa.get("min_conf", 0.0))):
             return []
@@ -1002,6 +1161,25 @@ class Planner:
             da = abs((a - ref + np.pi) % (2 * np.pi) - np.pi)
             if da <= np.radians(float(fa.get("max_dev_deg", 75.0))):
                 cands.append((da, a))
+        cands = [a for _, a in sorted(cands)]
+        k = int(variant) % len(cands) if cands else 0
+        return cands[k:] + cands[:k]
+
+    def lying_dirs(self, det, side, variant=0):
+        """A prism / cylinder lying on a side (Detection.lying): the pinch goes along its ridge / axis, the pads on the
+        two flat ends (parallel, one object length apart): finger directions ridge_yaw and ridge_yaw + 180 deg, the one
+        nearer the arm's natural direction (face_align.finger_ref_deg) first, within face_align.lying_max_dev_deg;
+        rotated by `variant`. Any profile (face_align.enabled does not matter: across the slopes it squeezes out)."""
+        fa = self.cfg["grasp"].get("face_align") or {}
+        ry = getattr(det, "ridge_yaw", None)
+        if ry is None or not fa.get("lying", True):
+            return []
+        ref = np.radians(float((fa.get("finger_ref_deg") or {}).get(side, -25.0 if side == "left" else 25.0)))
+        cands = []
+        for a in (ry, ry + np.pi):
+            da = abs((a - ref + np.pi) % (2 * np.pi) - np.pi)
+            if da <= np.radians(float(fa.get("lying_max_dev_deg", 100.0))):
+                cands.append((da, float((a + np.pi) % (2 * np.pi) - np.pi)))
         cands = [a for _, a in sorted(cands)]
         k = int(variant) % len(cands) if cands else 0
         return cands[k:] + cands[:k]
@@ -1033,6 +1211,11 @@ class Planner:
                 near = []
         if self._least:
             out, near = near, []
+        if getattr(det, "lying", False):       # lying: only the pinch on its two flat ends, at lying_height_frac
+            d2 = copy.copy(det)                # (where the ends are wide enough for the pads); nothing else
+            d2.grasp_height_frac = float(fa.get("lying_height_frac", g["height_frac"]))
+            return [dict(f=np.array([np.cos(a), np.sin(a), 0.0]), w=w_face, det=d2, tol=tol, hint=None,
+                         deg=float(np.degrees(a)), kind="face") for a in self.face_dirs(det, side, variant)]
         r_tri = self.scene.object_dims("triangle")["circumradius"]
         for a in self.face_dirs(det, side, variant):
             f = np.array([np.cos(a), np.sin(a), 0.0])
@@ -1118,7 +1301,7 @@ class Planner:
 
         # grasp height: object mid-height, raised until the preshaped fingers clear the counter
         xy = det.top[:2] + np.asarray((g.get("arm_xy_offset") or {}).get(side, [0.0, 0.0]), float)  # per-arm, TUNE
-        z = zc + g["height_frac"] * H
+        z = zc + (getattr(det, "grasp_height_frac", None) or g["height_frac"]) * H
         for _ in range(4):
             qg, ok = self._ik(side, np.r_[xy, z], arm_q, "grasp", plan)
             if not ok:
@@ -1146,13 +1329,20 @@ class Planner:
                                f"({('preshaped', 'closing', 'closed')[k]}; need {1000 * need[j]:.0f})")
                 return plan
 
-        wall = float(sc.cfg["bins"]["wall_height"])
-        z_carry = zc + max(g["carry_height"], wall + H + 0.03)
+        wall = self.boxes[bin_name].rim if bin_name in self.boxes else self.boxes.max_rim()   # (detected rim)
+        z_carry = zc + max(g["carry_height"], self.boxes.max_rim() + H + 0.03)
         z_drop = zc + wall + H / 2 + g["drop_above_rim"]
         if place_xy is not None:  # relocation: put it down on the counter (release just above the grasp height)
             bxy, z_drop = np.asarray(place_xy, float), z + 0.005
         else:
             bxy = self._drop_point(bin_name, side)
+        fr = None
+        if place_xy is None and self.far.applies(bin_name, side)[0]:   # grasp.far: no slot in reach (far.py)
+            fr, why = self.far.release(bin_name, side, hand_cls, hand_rel, alt=self.far_alt)
+            if fr is None:
+                plan.reason = why
+                return plan
+            bxy = fr.land[:2]
         P = {"pregrasp": np.r_[xy, max(z + g["approach_height"], z_carry)], "grasp": np.r_[xy, z], "lift": np.r_[xy, z_carry],
              "above_bin": np.r_[bxy, z_carry], "drop": np.r_[bxy, z_drop], "retreat": np.r_[bxy, z_drop + g["retreat_up"]]}
 
@@ -1172,9 +1362,13 @@ class Planner:
         if w_carry is not None:
             self.kin.w_hint = min(w_grasp, float(w_carry))
         try:
-            carry = up and self._carry(side, up[-1], P["lift"], P["above_bin"], z_drop, plan)
-            lower = carry and self._cartesian(side, P["above_bin"], P["drop"], carry[-1], "lower", plan)
-            retreat = lower and self._cartesian(side, P["drop"], P["retreat"], lower[-1], "retreat", plan)
+            if fr is not None:   # far release: joint space to its pose, no lower / retreat (far.py)
+                carry = up and self._far_carry(side, up[-1], fr.q, z_drop, plan)
+                lower, retreat = [], carry
+            else:
+                carry = up and self._carry(side, up[-1], P["lift"], P["above_bin"], z_drop, plan)
+                lower = carry and self._cartesian(side, P["above_bin"], P["drop"], carry[-1], "lower", plan)
+                retreat = lower and self._cartesian(side, P["drop"], P["retreat"], lower[-1], "retreat", plan)
         finally:
             self.kin.w_hint = w_grasp
         if not retreat:
@@ -1189,7 +1383,7 @@ class Planner:
 
         def move(name, Qs, hand_to=None):
             nonlocal cur_a, cur_h
-            a = time_scale([cur_a] + list(Qs), vmax, amax, self.dt)
+            a = self._timed([cur_a] + list(Qs), vmax, amax, cur_h)
             h = np.repeat(cur_h[None], len(a), 0)
             if hand_to is not None:  # hand moves during the arm move (ends no later than the arm)
                 hr = ramp(cur_h, hand_to, hv, self.dt)
@@ -1225,8 +1419,15 @@ class Planner:
         hand("close", hand_cls, mo["close_hold_s"])
         move("lift", up)
         move("carry", carry + lower)
-        hand("open", hand_rel, mo["open_hold_s"])  # widest posture: `open` alone left the cube wedged in the sim
-        move("retreat", retreat)
+        if fr is not None:   # far release: its own arm + hand ticks (settle, open, hold open) are the `open` phase
+            fa, fh = np.repeat(cur_a[None], len(fr.arm), 0), np.repeat(cur_h[None], len(fr.arm), 0)
+            fa[:, sl], fh[:, sl] = fr.arm, fr.hand
+            add("open", fa, fh)
+            cur_h = fh[-1].copy()
+            plan.waypoints["drop"], plan.far = np.asarray(fr.land, float), fr.info
+        else:
+            hand("open", hand_rel, mo["open_hold_s"])  # widest posture: `open` alone left the cube wedged in the sim
+            move("retreat", retreat)
         move("home", [home], hand_to=hand_open)
         plan.arm, plan.hand, plan.phases = np.vstack(arm_parts), np.vstack(hand_parts), phases
 
@@ -1247,6 +1448,11 @@ class Planner:
                 name = next(n for n, s_, e in phases if s_ <= k < e)
                 plan.reason = f"hand {100 * c:.1f} cm above a bin rim during {name}"
                 return plan
+        if fr is not None:   # grasp.far: the wrist (camera bracket) stays clear of the rims from the release home
+            why = self.far.bulk_why(side, plan.arm[next(s_ for n, s_, e in phases if n == "open")::2])
+            if why is not None:
+                plan.reason = f"far: {why} after the release"
+                return plan
         if not self._check_neighbours(side, arm_q, hand_q, plan):   # every tick vs the other objects
             return plan
         plan.safety_clips = self.dry_run_safety(arm_q, hand_q, plan.arm, plan.hand)
@@ -1257,13 +1463,20 @@ class Planner:
         return plan
 
     def dry_run_safety(self, arm_q, hand_q, arm, hand):
+        """Clipped steps of a fresh SafetyFilter (the env's config) fed the ticks (arm, hand) after the start pose
+        arm_q / hand_q, all intended: the filter sees what the policy will send (commanded(), sag feed-forward). With
+        the feed-forward a commanded tick in the filter's silent position band (inside the URDF limit by less than its
+        margin: clamped, not counted) also counts: the arm would not reach the planned pose there."""
         if self._dry is None:
             self._dry = SafetyFilter(self.spec, self.safety)
-        f = self._dry
+        f, band = self._dry, 0
+        if self.ff_on():
+            arm_q, arm = self.commanded(arm_q, hand_q), self.commanded(arm, hand)
+            band = int(((arm < f.arm_lo - 1e-9) | (arm > f.arm_hi + 1e-9)).any(1).sum()) if len(arm) else 0
         f.reset(arm_q, hand_q, 0.0)  # (reset clears every bit of episode state)
         for k in range(len(arm)):
             f.filter({"arm_q_target": arm[k], "hand_q_target": hand[k]}, (k + 1) * self.dt)
-        return f.clipped_steps
+        return f.clipped_steps + band
 
     def abort(self, side, arm_q, hand_q, rest_arm, rest_hand, neighbours=None):
         """Abort `side`'s part of an executing queue (verified miss / slip). arm_q, hand_q (14,): the last commanded
@@ -1293,8 +1506,15 @@ class Planner:
         f, j = (tau - i)[:, None], np.minimum(i + 1, R)
         dec_a, dec_h = P[i] + f * (P[j] - P[i]), Ph[i] + f * (Ph[j] - Ph[i])
         q0, h0 = (dec_a[-1], dec_h[-1]) if len(dec_a) else (P[0], Ph[0])
-        a = time_scale([q0, self.home[sl]], vmax, amax, dt)
+        a = self._timed([q0, self.home[sl]], vmax, amax, hand_q, arm_q, sl)
         h = ramp(h0, self.post["open"][sl], mo["hand_max_vel"], dt)
+        # The verdict "empty" can be wrong (an object held by one finger, a threshold that is off on the real hand):
+        # a hand opened over a box drops what it holds into THAT box, and a wrong box costs a point. So the hand
+        # keeps its posture until the grasp point has left every box (footprint + verify.abort_open_margin) for the
+        # rest of the way home; over the counter it opens at once, as before.
+        hold = self._abort_hold_ticks(side, arm_q, a)
+        if hold:
+            h = np.vstack([np.repeat(np.asarray(h0, float)[None], hold, 0), h])
         m = max(len(a), len(h))
         a = np.vstack([a, np.repeat(self.home[sl][None], m - len(a), 0)])
         h = np.vstack([h, np.repeat(self.post["open"][sl][None], m - len(h), 0)])
@@ -1328,6 +1548,20 @@ class Planner:
         if clips:
             return None, None, f"{clips} safety clips in dry run"
         return arm, hand, {"decel_ticks": len(dec_a), "home_ticks": m, "ticks": L, "saved_ticks": R - L}
+
+    def _abort_hold_ticks(self, side, arm_q, a):
+        """Ticks of an abort's move home `a` (T, 7) during which the hand must not open yet: up to the last tick at
+        which the grasp point is over a box (outer footprint + verify.abort_open_margin, m). 0: never over one, or
+        the rule is off (no margin configured)."""
+        margin = (self.cfg.get("verify") or {}).get("abort_open_margin")
+        if margin is None or not len(a):
+            return 0
+        sl, q, last = ArmKinematics.sl(side), np.asarray(arm_q, float).copy(), 0
+        for k in range(len(a)):
+            q[sl] = a[k]
+            if bool(self.boxes.inside_any(self.kin.grasp_pose(side, q)[0][:2], float(margin))):
+                last = k + 1
+        return last
 
     # ------------------------------------------------------------------ settle and correct (grasp.correct)
     def correction_dq(self, side, arm_cmd, arm_meas):
@@ -1392,6 +1626,11 @@ class Planner:
             return None, f"|dq| {np.abs(dq).max():.3f} rad on {self.spec.arm_names[sl][j]} > max_dq"
         vstep, ad = float(mo["arm_max_vel"]) * dt, np.abs(dq)
         step = np.abs(np.diff(np.vstack([np.asarray(arm_q, float)[None, sl], rest_arm[:, sl]]), axis=0))  # planned
+        if self.ff_on():   # the commanded ticks move faster or slower than the intended ones: the larger counts
+            end0 = min(ph["open"][1] if "open" in ph else R, R)
+            Q = np.vstack([np.asarray(arm_q, float)[None], rest_arm[:end0]])
+            Hq = np.vstack([np.asarray(hand_q, float)[None], rest_hand[:end0]])
+            step[:end0] = np.maximum(step[:end0], np.abs(np.diff(self.commanded(Q, Hq)[:, sl], axis=0)))
         w = np.zeros(R)
         w[:c0] = 0.5 - 0.5 * np.cos(np.pi * np.arange(1, c0 + 1) / c0)
         k = min(l0 + int(round(float(cc.get("hold_lift_s", 0.1)) / dt)), R)
@@ -1450,7 +1689,7 @@ class Planner:
     def go_to(self, arm_from, hand_from, arm_to, hand_to):
         """Joint-space move (both arms + hands) at the configured speeds, e.g. start pose -> home."""
         mo = self.cfg["motion"]
-        a = time_scale([arm_from, arm_to], mo["arm_max_vel"], mo["arm_max_acc"], self.dt)
+        a = self._timed([arm_from, arm_to], mo["arm_max_vel"], mo["arm_max_acc"], hand_from)
         h = ramp(hand_from, hand_to, mo["hand_max_vel"], self.dt)
         n = max(len(a), len(h))
         a = np.vstack([a, np.repeat(np.asarray(arm_to, float)[None], n - len(a), 0)]) if len(a) < n else a

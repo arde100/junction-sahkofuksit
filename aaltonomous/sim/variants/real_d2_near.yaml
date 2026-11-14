@@ -1,0 +1,9 @@
+# real_d2 with the box row NEAR and turned the other way (drop-2 session 2: front 0.48, right end farther).
+# Use: docker exec -e AALTO_VARIANT=real_d2_near aalto-b bash -lc "aalto sim"
+name: real_d2_near
+inherit: real_d2
+notes: real_d2, row front 0.46, right end farther (report yaw -7)
+
+boxes:
+  front_x: 0.46      # M range: episodes 0.47-0.62 (a little nearer than the nearest episode)
+  yaw_deg: 7.0       # = the report's "-7": CCW sign here, so the LEFT box is nearer, the right one farther

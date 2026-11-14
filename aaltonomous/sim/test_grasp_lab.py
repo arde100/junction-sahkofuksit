@@ -7,6 +7,9 @@ import os
 import tempfile
 import unittest
 
+import numpy as np
+
+from aaltonomous.scene.scene import Scene
 from aaltonomous.sim import grasp_lab as gl
 
 GOOD = (0.39, 0.155)     # mat xy -> pelvis (0.295, -0.06): right arm
@@ -117,12 +120,82 @@ class TestGraspLabMock(unittest.TestCase):
         self.assertTrue(forced["plan_ok"], forced["plan_reason"])
         self.assertAlmostEqual(forced["finger_yaw_deg"], 30.0, delta=12.0)
 
+    def test_profile_switch(self):
+        """--profile oracle (default) = ORACLE_OVERRIDES as before; --profile base = the classical config's base values
+        (the robot profile: base hand postures, grasp point, sag prior, face_align off) with the flags and --set on
+        top; --profile <name> = that config profile; rows and meta say which."""
+        from aaltonomous.baselines.classical.config import load_config
+        from aaltonomous.sim import oracle
+        cfg, _ = gl.build_cfg(gl.parser().parse_args([]))
+        self.assertEqual(cfg["hand"]["closed"], oracle.ORACLE_OVERRIDES["hand.closed"])
+        self.assertEqual(cfg["grasp"]["point_in_palm"], oracle.ORACLE_OVERRIDES["grasp.point_in_palm"])
+        self.assertEqual(cfg["motion"]["arm_max_vel"], oracle.ORACLE_OVERRIDES["motion.arm_max_vel"])
+        self.assertTrue(cfg["grasp"]["face_align"]["enabled"])
+        self.assertEqual(cfg, gl.build_cfg(gl.parser().parse_args(["--profile", "oracle"]))[0])
+        base = load_config(profile="none")
+        cfg, _ = gl.build_cfg(gl.parser().parse_args(["--profile", "base"]))
+        for k in ("hand", "grasp", "motion", "sag", "verify", "home_arm_q"):
+            self.assertEqual(cfg[k], base[k], k)
+        cfg, user = gl.build_cfg(gl.parser().parse_args(
+            ["--profile", "base", "--face-align", "--ff", "off", "--correct", "off", "--set",
+             '{"hand.closed": [0, 0.5, 1.0, -1.0, -1.4, -1.0, -1.4], "motion.arm_max_vel": 0.8}']))
+        self.assertEqual((cfg["grasp"]["face_align"]["enabled"], cfg["sag"]["enabled"], cfg["grasp"]["correct"]["enabled"]),
+                         (True, False, False))
+        self.assertEqual((cfg["hand"]["closed"], cfg["motion"]["arm_max_vel"]), ([0, 0.5, 1.0, -1.0, -1.4, -1.0, -1.4], 0.8))
+        self.assertEqual(cfg["hand"]["open"], base["hand"]["open"])
+        self.assertEqual(user["motion.arm_max_vel"], 0.8)
+        sim = load_config(profile="sim")
+        self.assertEqual(gl.build_cfg(gl.parser().parse_args(["--profile", "sim"]))[0]["hand"], sim["hand"])
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "lab.jsonl")
+            rows = gl.main(["--plan-only", "--profile", "base", "--shapes", "cube", "--yaws", "0", "--xs", str(GOOD[0]),
+                            "--ys", str(GOOD[1]), "--out", out])
+            with open(out) as f:
+                meta = json.loads(f.readline())
+        self.assertTrue(rows[0]["plan_ok"], rows[0]["plan_reason"])
+        self.assertEqual((rows[0]["profile"], rows[0]["face_align"]), ("base", False))
+        self.assertEqual((meta["profile"], meta["cfg"]["hand"]), ("base", base["hand"]))
+        r = gl.main(["--mock", "--profile", "base", "--shapes", "cube", "--yaws", "0", "--xs", str(GOOD[0]), "--ys",
+                     str(GOOD[1]), "--hold", str(HOLD), "--time-limit", "80"])[0]
+        self.assertEqual((r["outcome"], r["clips"], r["profile"]), ("ok", 0, "base"), r.get("error"))
+        self.assertGreater(r["sig_fs_1s"], 0.0)    # the robot's verification signal is recorded too
+        # joints per phase (LEFT convention) inside the base profile's ik.joint_range (W1), measured at the close
+        lo, hi = (np.degrees(np.asarray([v[i] for v in base["ik"]["joint_range"].values()], float)) for i in (0, 1))
+        for ph, (mn, mx) in r["joints_deg"].items():
+            if ph not in ("home", "to_pregrasp"):   # (moves from the start pose: the lab homes to the sim's ARM_HOME)
+                self.assertTrue(np.all(np.asarray(mn) >= lo - 1) and np.all(np.asarray(mx) <= hi + 1), (ph, mn, mx))
+        self.assertEqual(len(r["joints_close_meas_deg"]), 7)
+
+    def test_neighbour(self):
+        """--neighbour: a second object placed next to every case object; the case object is the one at the case
+        position (followed by name), the other is reported (nb_disp_mm / nb_tilt_deg) and planned around when
+        neighbours.enabled (a neighbour where the hand must go -> no plan, the case is recorded as such)."""
+        base = ["--mock", "--profile", "base", "--shapes", "cube", "--yaws", "0", "--xs", str(GOOD[0]), "--ys",
+                str(GOOD[1]), "--hold", str(HOLD), "--time-limit", "80"]
+        r = gl.main(base + ["--neighbour", "110,0", "--set", '{"neighbours.enabled": true}'])[0]
+        self.assertEqual((r["outcome"], r["clips"]), ("ok", 0), r.get("error") or r.get("plan_reason"))
+        self.assertTrue(r["nb_planned"])
+        self.assertLess(r["nb_disp_mm"], 1.0)                          # the mock moves nothing it does not grasp
+        self.assertLess(r["displaced_mm"], 5.0)                        # (the case object, not the neighbour)
+        off = gl.main(base + ["--neighbour", "110,0", "--set", '{"neighbours.enabled": false}'])[0]   # (base: on)
+        self.assertEqual(off["outcome"], "ok", off.get("error"))
+        self.assertFalse(off["nb_planned"])
+        cases = gl.make_cases(gl.parser().parse_args(["--shapes", "cube", "--yaws", "0", "--xs", "0.4", "--ys", "0.15",
+                                                      "--neighbour", "60,0;0,-60", "--neighbour-shape", "triangle"]),
+                              Scene.load())
+        self.assertEqual([(n["shape"], round(n["x"], 3), round(n["y"], 3)) for n in cases[0]["nb"]],
+                         [("triangle", 0.46, 0.15), ("triangle", 0.4, 0.09)])
+        # 7 cm beside it: the base cage's hand (fingers +-41.5 mm wide, sphere model ~13 mm more) comes too close
+        blk = gl.main(["--plan-only"] + base[1:] + ["--neighbour", "70,0", "--set", '{"neighbours.enabled": true}'])[0]
+        self.assertFalse(blk["plan_ok"])
+        self.assertIn("mm from", blk["plan_reason"])
+
     def test_correct_switch_on_the_sagging_mock(self):
         """--correct on / dwell / off on the mock with the sim's arm sag (--mock-sag): on = shift applied, grasp
         point at the close within 1 mm of the planned one; dwell = settle phase and measurement, no shift, the sag
         error stays; off = no settle phase; all three grasps held (4 cm attach radius)."""
         base = ["--mock", "--mock-sag", "--shapes", "cube", "--yaws", "0", "--xs", str(GOOD[0]), "--ys", str(GOOD[1]),
-                "--hold", str(HOLD)]
+                "--hold", str(HOLD), "--ff", "off"]   # (the correction alone; with the feed-forward: the test below)
         rows = {m: gl.main(base + ["--correct", m])[0] for m in ("on", "dwell", "off")}
         for m, r in rows.items():
             with self.subTest(m):
@@ -138,6 +211,27 @@ class TestGraspLabMock(unittest.TestCase):
         self.assertAlmostEqual(on["phase_s"]["settle"], 0.4, places=2)
         self.assertGreater(off["err_close_norm_mm"], 4.0)
         self.assertEqual(len(on["err_close_along_across_up_mm"]), 3)
+        self.assertEqual(on["err_pre_corr_norm_mm"], on["corr"]["err_norm_mm"])
+        self.assertNotIn("err_pre_corr_norm_mm", off)
+
+    def test_ff_switch_on_the_sagging_mock(self):
+        """--ff on (the oracle's default: profile sim's prior): the sagging mock arm is at the planned grasp point
+        before any correction (err_pre_corr < 0.5 mm, the correction refused below min_err), 0 clips, held; --ff
+        off: the sag (> 4 mm) is what the correction removes. --ff on with --correct off: < 0.5 mm at the close."""
+        base = ["--mock", "--mock-sag", "--shapes", "cube", "--yaws", "0", "--xs", str(GOOD[0]), "--ys", str(GOOD[1]),
+                "--hold", str(HOLD)]
+        on, off = gl.main(base + ["--ff", "on", "--correct", "dwell"])[0], gl.main(base + ["--ff", "off"])[0]
+        alone = gl.main(base + ["--ff", "on", "--correct", "off"])[0]
+        for r in (on, off, alone):
+            self.assertEqual((r["outcome"], r["clips"]), ("ok", 0), r.get("error"))
+        self.assertEqual((on["ff"], off["ff"]), (True, False))
+        self.assertLess(on["err_pre_corr_norm_mm"], 0.5)
+        self.assertLess(on["err_close_norm_mm"], 0.5)
+        self.assertGreater(off["err_pre_corr_norm_mm"], 4.0)
+        self.assertLess(alone["err_close_norm_mm"], 0.5)
+        self.assertEqual(gl.build_cfg(gl.parser().parse_args(["--plan-only"]))[0]["sag"]["enabled"], True)
+        self.assertEqual(gl.build_cfg(gl.parser().parse_args(["--plan-only", "--ff", "off"]))[0]["sag"]["enabled"],
+                         False)
 
     def test_plan_failure_miss_and_errors(self):
         a = gl.parser().parse_args(["--mock", "--hold", str(HOLD)])

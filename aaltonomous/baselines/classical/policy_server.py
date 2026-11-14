@@ -10,7 +10,8 @@ Uses only head_rgb, head_depth, arm_q, hand_q, t from obs; camera intrinsics/ext
 calibration.yaml baked into the image (spec §11), so rebuild after a calibration change.
 Target bins come from the instruction text of each reset (instruction.py; no text: the fixed rung-1 mapping); what
 was understood (and any problem) is logged once per reset. Objects whose bin was not understood stay on the counter.
-Rung 3 (insert_shapes) is not done: its instruction names no bin, so nothing is sorted.
+Rung 3 (insert_shapes: the reset's task id, or a lid / hole instruction; insert.py) sorts nothing: the holes are out
+of the arms' reach, and the lid lies on the left bin (a drop there scores -1).
 Env: AALTO_TIME_LIMIT (s, default 120; must match the runner's --time-limit), AALTO_ARM_VEL (rad/s override),
 AALTO_PROFILE (config.yaml profile; unset = the file's `sim`, `none` = robot base values; `auto` = the image's
 default: detect sim / real robot per episode and use `sim` / `none`, autoprofile.py).
@@ -46,19 +47,61 @@ class ClassicalServerPolicy(Policy):
                                    log=lambda m: log.info(m), **kw)
         self.action_horizon = int(self.pol.cfg["motion"]["chunk"])
 
+    STALE_MAX_S = 90.0   # a planning thread of the previous episode still alive after this long: reset anyway
+
     def reset(self, instruction, task=None, seed=None):
-        # An episode can end mid-look (time limit): let that planning thread finish before the next one starts,
-        # the kinematics/planner state is not thread-safe.
-        job, t0 = self.pol._job, time.monotonic()
-        while job is not None and job["result"] is None and time.monotonic() - t0 < 30.0:
-            time.sleep(0.02)
-        if task == "insert_shapes":
-            log.warning("task %r: the classical baseline does not do rung 3 (sorts nothing)", task)
+        # An episode can end mid-look (time limit) with its planning thread still running, and the kinematics /
+        # planner state is not thread-safe. NEVER wait for it here: the runner's watchdog safe-stops an episode
+        # after 1 s without a command, counted from its own reset (a blocked reset = a dead episode = a failed sim
+        # gate). The reset is deferred instead: act() holds until that thread has ended, then resets and goes on.
+        job = self.pol._job
+        self._pending, self._probe = (instruction, task, seed), None
+        self._stale = job if job is not None and job["result"] is None else None
+        self._stale_t0, self._hold = time.monotonic(), None
+        if self._stale is None:
+            self._reset_now()
+        else:
+            log.info("reset task=%s seed=%s deferred: the previous episode's look is still running", task, seed)
+
+    def reset_waiting(self):
+        """True while a deferred reset waits for the previous episode's planning thread (autoprofile then holds)."""
+        if getattr(self, "_pending", None) is None:
+            return False
+        st = self._stale
+        if st is not None and st["result"] is None and time.monotonic() - self._stale_t0 < self.STALE_MAX_S:
+            return True
+        return False
+
+    def _reset_now(self):
+        instruction, task, seed = self._pending
+        self._pending = self._stale = None
         log.info("reset task=%s seed=%s instruction=%r", task, seed, instruction)
-        self.pol.reset({"instruction": instruction})   # logs the mapping it understood (ClassicalPolicy._mapping)
+        # logs the mapping it understood (ClassicalPolicy._mapping); task insert_shapes -> rung-3 mode (insert.py)
+        self.pol.reset({"instruction": instruction, "task": task})
         log.info("mapping (%s): %s", self.pol.mapping_source, self.pol.mapping)
+        if self._probe is not None:
+            probe, self._probe = self._probe, None
+            self.feed_probe(probe)
+
+    def feed_probe(self, result):
+        """autoprofile hand-over: the world probe's still arm = the first sample of the sag feed-forward estimate."""
+        if getattr(self, "_pending", None) is not None:   # reset deferred: after it
+            self._probe = result
+            return
+        r = self.pol.feed_probe(result)
+        if r is not None:
+            log.info("sag feed-forward: probe sample (%d obs) %s", r[3], "used" if r[1].any() else "refused")
 
     def act(self, obs):
+        if getattr(self, "_pending", None) is not None:
+            if self.reset_waiting():   # hold the first pose seen (a constant target: no step for the safety filter)
+                if self._hold is None:
+                    sp = self.pol.spec
+                    self._hold = (np.clip(np.asarray(obs["arm_q"], np.float64), sp.arm_lower, sp.arm_upper),
+                                  np.clip(np.asarray(obs["hand_q"], np.float64), sp.hand_lower, sp.hand_upper))
+                return {"arm_q_target": self._hold[0][None].copy(), "hand_q_target": self._hold[1][None].copy(),
+                        "done": False}
+            self._reset_now()
         a = self.pol.act(obs)
         return {"arm_q_target": np.asarray(a["arm_q_target"], np.float64),
                 "hand_q_target": np.asarray(a["hand_q_target"], np.float64), "done": bool(a.get("done", False))}

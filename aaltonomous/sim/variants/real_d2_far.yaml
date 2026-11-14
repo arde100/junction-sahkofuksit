@@ -1,0 +1,9 @@
+# real_d2 with the box row FAR and turned (drop-2 sessions 3 / 4 and the farthest episodes: left end farther).
+# Use: docker exec -e AALTO_VARIANT=real_d2_far aalto-b bash -lc "aalto sim"
+name: real_d2_far
+inherit: real_d2
+notes: real_d2, row front 0.56, left end farther (report yaw +10)
+
+boxes:
+  front_x: 0.56      # M range: episodes 0.47-0.62
+  yaw_deg: -10.0     # = the report's "+10": CCW sign here, so the LEFT box is farther (session 3 was -14 here)

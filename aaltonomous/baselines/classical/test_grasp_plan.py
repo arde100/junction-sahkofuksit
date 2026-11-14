@@ -66,7 +66,9 @@ class TestSlots(unittest.TestCase):
             for b, side in combos:
                 with self.subTest(profile=profile, bin=b, side=side):
                     S = pl.slots(b, side)
-                    self.assertEqual(len(S), s["count"])
+                    # (base: the cage's grasp point sits 14 mm nearer the wrist than the old claw's: only the near
+                    # row (3) passes the reach test at the scene's box row)
+                    self.assertEqual(len(S), s["count"] if profile == "sim_legacy" else 3)
                     lo, hi = SC.bin_inner_box(b)
                     m = SC.pelvis_to_mat(np.c_[S, np.zeros(len(S))])[:, :2]
                     self.assertTrue(np.all(m >= lo[:2] + s["wall_clear"] - 1e-9) and np.all(m <= hi[:2] - s["wall_clear"]

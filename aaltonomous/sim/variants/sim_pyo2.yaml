@@ -1,0 +1,13 @@
+# As sim_pyo with other shades (the CSS "orange", "yellow", "purple"): orange nearer to yellow, purple nearer to
+# magenta. A second guess at what a held-out selection sim with purple / yellow / orange objects could render.
+# Use: docker exec -e AALTO_VARIANT=sim_pyo2 aalto-b bash -lc "aalto sim"
+name: sim_pyo2
+notes: upstream sim, objects rendered CSS orange / yellow / purple, colour words renamed
+
+colors:
+  objects:
+    red: [255, 165, 0]      # GUESS: CSS orange, OpenCV H ~19
+    yellow: [255, 255, 0]   # GUESS: CSS yellow, H 30
+    blue: [128, 0, 128]     # GUESS: CSS purple, H 150
+
+color_words: {red: orange, blue: purple}

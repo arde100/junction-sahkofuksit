@@ -1,0 +1,21 @@
+# real_d2 (the measured real setup) + the RUNNER's soft waist and the head camera on the torso: an arm reaching forward bends the torso
+# (~1 deg per 5 Nm at kp 300), which lowers the hand by up to a centimetre and tilts the head camera; the arm joints
+# cannot see it (handoffs/shake/REPORT.md). Use: docker exec -e AALTO_VARIANT=real_d2_waist aalto-b bash -lc "aalto sim"
+name: real_d2_waist
+inherit: real_d2
+notes: real_d2 + waist PD 300 / 3 as the real runner, head camera on the torso
+
+robot:
+  actuators:
+    waist:  # the RUNNER's values (FACT: DDSBackend / upstream G1_29_ArmController lock legs + waist at kp 300 / kd 3 at
+            # their start pose); upstream sim 10000 / 10000, effort 1000 = rigid. Arm moments now bend the torso (~1 deg
+            # per 5 Nm), which moves the hands and, with head_camera.parent below, the head camera (shake/REPORT.md).
+      stiffness: 300.0    # FACT
+      damping: 3.0        # FACT
+      effort_limit: {"waist_yaw_joint": 88.0, "waist_(roll|pitch)_joint": 50.0}   # URDF (USD maxForce 88 / 35 / 35)
+      # armature: upstream's (None = the USD value)
+
+head_camera:
+  parent: torso_link   # FACT: the real D435 sits on the torso (URDF d435_link is fixed to torso_link); same pose at
+                       # waist 0 as the organisers' pelvis mount, but it now moves with the soft waist above
+

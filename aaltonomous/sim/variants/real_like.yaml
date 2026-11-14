@@ -1,0 +1,54 @@
+# "Real-like" variant of OUR sim: what we know (2026-11-14) about where the organisers' robot differs from their sim.
+# Use: docker exec -e AALTO_VARIANT=real_like aalto-b bash -lc "aalto sim"   (unset = the organisers' sim exactly)
+# Schema + semantics: aaltonomous/sim/aalto_task/variant.py. Tags: FACT = measured / stated by the organisers or the
+# runner code; URDF = joint_spec.yaml (from the URDF); GUESS = ours, replace when measured.
+name: real_like
+notes: arm + finger PD as the real runner, joint_spec hand wiring, full joint range, purple / yellow / orange objects
+
+robot:
+  # Upstream 0.9: RobotController clamps every PD target into the middle 90 % of the USD joint range (sim only; the
+  # real motors take any target, our SafetyFilter keeps 0.05 rad inside the URDF range). 1.0 = clamp at the USD range.
+  soft_joint_pos_limit_factor: 1.0
+  actuators:
+    arms:   # upstream 300 / 400 / 400 and 3 / 2.5 / 2.5; the sim ignores the DDS kp / kd, so these ARE the gains
+      stiffness: {".*_shoulder_.*_joint": 80.0, ".*_elbow_joint": 80.0, ".*_wrist_.*_joint": 40.0}   # FACT (G1_29_ArmController)
+      damping: {".*_shoulder_.*_joint": 3.0, ".*_elbow_joint": 3.0, ".*_wrist_.*_joint": 1.5}        # FACT
+      effort_limit: {".*_shoulder_.*_joint": 25.0, ".*_elbow_joint": 25.0, ".*_wrist_roll_joint": 25.0,
+                     ".*_wrist_(pitch|yaw)_joint": 5.0}                                           # URDF (upstream: USD value)
+      # GUESS (recalled from Unitree's G1 RL configs, unverified): reflected rotor inertia of the 5020 / 4010 motors
+      armature: {".*_shoulder_.*_joint": 0.003609725, ".*_elbow_joint": 0.003609725, ".*_wrist_roll_joint": 0.003609725,
+                 ".*_wrist_(pitch|yaw)_joint": 0.00425}
+    hands:  # upstream 100 / 10, armature 0.1, effort 300. AALTO_HAND_GAINS, if set, overrides this section.
+      stiffness: 1.5      # FACT (DDSBackend hand_kp, organisers 2026-11-14)
+      damping: 0.2        # FACT (hand_kd)
+      armature: 0.002     # GUESS (upstream 0.1 is a stabiliser; a small Dex3 motor reflects far less)
+      effort_limit: {".*_hand_thumb_0_joint": 2.45, ".*_hand_(thumb_[12]|index_.|middle_.)_joint": 1.4}   # URDF
+    # waist: rigid here (upstream 10000 / 10000). The runner's soft waist (kp 300 / kd 3) + the head camera on the torso
+    #   are in real_like_waist.yaml / real_d2_waist.yaml, kept apart so that grasp experiments on real_like / real_d2
+    #   keep their conditions until the policy compensates the bending torso.
+  right_hand_wiring: spec   # FACT (joint_spec.yaml, measured on the robot): right = thumb 0-2, index 3-4, middle 5-6
+
+colors:   # render only; internal names (red / yellow / blue) stay in the task logic and scoring
+  # Albedos chosen so that the HEAD CAMERA sees the real medians of data drop 2 (OpenCV H / S / V in brackets). The
+  # renderer does not show the albedo hue: a saturated orange is seen ~8 hue units nearer to yellow at any light level
+  # (albedo H 11.6 -> seen 19-21), so the orange albedo is redder than what the camera reports. Measured through the
+  # camera with `probe_variant scene` in real_d2 (2026-11-14 sweep): orange ~11-12 / 161 / 207, yellow 30 / ~120 /
+  # ~140 (V estimated from the albedo change), purple 111 / 117 / 202.
+  objects:
+    red: [184, 48, 18]      # real "orange": camera 11 / 158 / 192
+    yellow: [95, 95, 22]    # real "yellow": camera 30 / 112 / 135
+    blue: [36, 60, 179]     # real "purple" (the camera sees blue-violet): camera 111 / 102 / 176
+  # bins: [230, 110, 30]    # scene.yaml's orange (default); NB close to the orange objects: check on real frames
+  # counter: [140, 115, 90]
+  # mat_tint: [1.0, 1.0, 1.0]
+
+color_words: {red: orange, blue: purple}   # FACT (organisers: real objects purple, yellow, orange)
+
+# To come from the real dataset (examples of the schema, off):
+# lighting: {dome: {intensity: 800.0, rgb: [0.9, 0.9, 0.9]}, key: {intensity: 60000.0, rgb: [1.0, 0.97, 0.92], pos: [0.5, 0.0, 2.2]}}
+# head_camera: {pos_offset: [0.0, 0.0, 0.0], rot_offset_deg: [0.0, 0.0, 0.0]}
+# mat: true
+# scene:
+#   counter: {mat_origin_in_pelvis: [0.14, -0.45, 0.01]}
+#   bins: {centers: {left: [0.71, 0.365], center: [0.45, 0.365], right: [0.19, 0.365]}, outer_size: [0.21, 0.21],
+#          wall_height: 0.06}

@@ -64,6 +64,7 @@ ORACLE_OVERRIDES = {
     "grasp.point_in_palm": _SIM["grasp"]["point_in_palm"],
     **{f"hand.{k}": v for k, v in _SIM["hand"].items()},
     "ik.joint_margin": _SIM["ik"]["joint_margin"],
+    "ik.joint_range": _SIM["ik"].get("joint_range"),   # (none in sim: the base's real-arm range must not reach here)
     "right_hand_slots": _SIM["right_hand_slots"],
     "motion.open_hold_s": 0.4,
     "grasp.arm": "by_y",          # first valid arm (preferred side first) instead of planning both: ~2x faster looks
@@ -96,6 +97,8 @@ ORACLE_OVERRIDES = {
     **{f"neighbours.{k}": _SIM["neighbours"][k] for k in ("enabled", "margin", "floor", "order_free")},
     # Settle and correct (profile sim's values): the measured sag of the arm at the grasp is removed before the close.
     **{f"grasp.correct.{k}": v for k, v in _SIM["grasp"]["correct"].items()},
+    # Sag feed-forward (profile sim's values: the fitted sim gains as the prior, learned online from measured joints).
+    **{f"sag.{k}": v for k, v in _SIM["sag"].items()},
 }
 # Relay candidates (pelvis xy, m), tried in order; must be >= RELAY_CLEAR from every other object centre.
 RELAY_POINTS = [(0.30, 0.0), (0.30, 0.05), (0.30, -0.05), (0.27, 0.0), (0.34, 0.0), (0.27, 0.06), (0.27, -0.06)]
@@ -198,6 +201,7 @@ class OraclePolicy(ClassicalPolicy):
         rcfg["grasp"]["slots"]["enabled"] = False      # relay "bins" are counter points: no slots
         self.relay = Planner(rcfg, _relay_scene(self.scene, self.cfg), self.post, self.home, self.kin, self.safety,
                              self.spec)
+        self.attach_ff(self.planner, self.relay)       # (sag feed-forward: commanded ticks in their dry runs)
         self.relays = {}
 
     def reset(self, info=None):
@@ -234,7 +238,8 @@ class OraclePolicy(ClassicalPolicy):
         out = super()._start(plan, t)
         if self.prefetch and plan.arm is not None and len(plan.arm):
             job = {"arm": plan.arm[-1].copy(), "hand": plan.hand[-1].copy(), "t": t + plan.duration,
-                   "exclude": {getattr(p, "obj", None) for p in parts} - {None}, "result": None, "dets": None}
+                   "exclude": {getattr(p, "obj", None) for p in parts} - {None}, "result": None, "dets": None,
+                   "ff": self._ff_version()}
             job["thread"] = threading.Thread(target=self._prefetch_job, args=(job,), daemon=True)
             self._pre = job
             job["thread"].start()
@@ -267,10 +272,21 @@ class OraclePolicy(ClassicalPolicy):
                 if (all(now.get(q.obj) is not None and np.linalg.norm(now[q.obj].top[:2] - q.obj_xy) < 0.01
                         for q in p.parts or [p] if not q.evade)        # object(s) still where planned, and every
                         and all(n in pre and np.linalg.norm(d.top[:2] - pre[n]) < 0.01   # object on the counter is
-                                for n, d in now.items())):             # one it planned around (a missed one is not)
+                                for n, d in now.items())               # one it planned around (a missed one is not)
+                        and self._ff_still_ok(job, p)):
                     self._commit(p)
                     return ("plan", p, len(now))
         return self._plan_next(self.arm_cmd, self.hand_cmd, t=t)
+
+    def _ff_version(self):
+        return None if self.ff is None else self.ff.version
+
+    def _ff_still_ok(self, job, p):
+        """Sag feed-forward: a prefetched plan was dry-run at the gain applied then; the settle before this look may
+        have blended in a new one: dry-run it again at the current gain (0 clips) or plan afresh."""
+        if job.get("ff") == self._ff_version():
+            return True
+        return self.planner.dry_run_safety(self.arm_cmd, self.hand_cmd, p.arm, p.hand) == 0
 
     def _commit(self, p):
         if p.relay is not None:

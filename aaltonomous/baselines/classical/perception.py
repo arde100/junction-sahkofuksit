@@ -12,10 +12,15 @@ in-plane shift are not observable from the plane and stay as calibrated. Poor fi
 must be fixed in the pelvis frame): then x, y and yaw from the bin walls in the levelled depth (FFT coarse search +
 trimmed point-to-line Gauss-Newton), guarded likewise (self.reg). Every pixel -> pelvis conversion below uses the
 corrected pose (self.T).
+Boxes (perception.boxes, bins.py): then the three boxes are found in the levelled depth and fused over the episode
+(self.box_det = this look, self.boxes = what is used). Mode on: every bin footprint below (object masks, "in a bin",
+wall pieces) is the detected boxes' (yawed); off / log: scene.yaml's.
 Geometry first (perception.geometry_first, _detect_geometry; needs depth and, by default, a levelled pose): candidate
 pixels = a 3D point in the height band over the mat, outside the bin footprints -> holes filled, opening ->
 connected components. Colour only classifies (nearest reference hue per pixel, saturation-weighted vote over the
-blob, perception.color): a component whose colours lie an object apart is split; pixels clearly above the
+blob, perception.color; the classes, each with one or several reference hues, are the world's (world_classes) or
+the episode's (set_classes <- colors.match_colors: named by the instruction's words); each detection also carries
+its own mean hue): a component whose colours lie an object apart is split; pixels clearly above the
 component's own-colour top face are something over it (a finger) and are dropped; a component without pixels near
 the counter (a top-face piece cut off by a finger, something hovering), of implausible size, or next to a bin and
 wall-high or shapeless is no object; no acceptable colour -> color "unknown". Without usable depth (or levelling):
@@ -26,6 +31,11 @@ T_pelvis_optical), keep the top face (points within `top_band` of a robust max h
 as the top centre. With too few valid depth pixels (holes, or no depth stream) the blob centroid ray is intersected
 with the plane at the known object height instead (method "plane"). Blobs over the bins, off the mat, or at a wrong
 height are rejected.
+Touching objects (perception.touching, _split_touching): a blob whose upper part holds several objects (distance-
+transform peaks, or larger than any one object) is cut into them (k-means on a top-view grid) before measuring; the
+detections carry `split` = how many. Lying (perception.lying, _lying, first in _fit_shape): the height profile tells a
+flat top (upright: the footprint fit below) from a ridge (a prism on a rectangular side: shape triangle, lying,
+ridge_yaw, top = the ridge's centre) or a rounded top (a cylinder on its side); not clearly any: shape None.
 Shape (perception.shape, _fit_shape): the known footprints (cube / cylinder / triangle, scene.yaml size) are fitted
 to the top-face outline on the top plane; yaw is in the oracle's convention (scene.shape_polygon rot: cube face
 normals at yaw + k*90 deg, triangle apexes at yaw + 90 + k*120 deg). shape None = not sure (occluded, washed out).
@@ -56,6 +66,12 @@ class Detection:
     fit: dict | None = None    # footprint fit diagnostics (rms_mm per shape, shrink_mm, n_hull, ...)
     color_frac: float = 1.0    # geometry first: winner's share of the saturation-weighted colour votes ...
     n_votes: int = 0           # ... of this many classified pixels (0 = colour-first detection)
+    hue: float | None = None   # geometry first: the blob's own hue (OpenCV 0-180, saturation-weighted circular mean)
+    hue_sd: float | None = None   # ... its circular sd (hue units) ...
+    hue_hist: tuple | None = field(default=None, repr=False)   # ... and (weight, count) histograms over the 180 hues
+    lying: bool = False        # a prism / cylinder lying on a side (shape "triangle" / "cylinder"; perception.lying)
+    ridge_yaw: float | None = None   # ... its ridge / axis direction (rad about pelvis z, mod pi)
+    split: int = 0             # cut out of a blob of this many touching objects (0: alone)
 
     def __repr__(self):
         x, y, z = self.top
@@ -89,6 +105,61 @@ class Perception:
         self.reg = {"used": False, "why": "not run"}           # last bin registration result (see _register)
         if self.rg.get("enabled"):
             self._init_register()
+        self._init_boxes()
+
+    # ---------------------------------------------------------------- boxes (bins.py, perception.boxes)
+    def _init_boxes(self):
+        """self.boxes = the boxes every mask uses (and the policy hands to the planner): scene.yaml's, or with
+        perception.boxes.mode on the episode's detected ones (BoxTracker). mode log: detected and logged only."""
+        from .bins import BoxDetector, Boxes, BoxTracker
+        self.bx = dict(self.cfg.get("boxes") or {"mode": "off"})
+        self.bx["mode"] = {True: "on", False: "off", None: "off"}.get(self.bx.get("mode"), self.bx.get("mode"))
+        self.boxes_prior = Boxes.from_scene(self.scene)
+        self.boxes = self.boxes_prior
+        self.boxes_on = self.bx.get("mode") == "on"
+        self.box_det = {"used": False, "why": "off" if self.bx.get("mode", "off") == "off" else "not run"}
+        self.arm_spheres = None        # [(centres (n, 3), radii (n,))] of the arms at this frame (policy): self-mask
+        self._box_det = self._box_track = None
+        if self.bx.get("mode", "off") != "off":
+            self._box_det = BoxDetector(self.bx, self.scene)
+            self._box_track = BoxTracker(self.bx, self.boxes_prior)
+            if self.boxes_on:
+                self.boxes = self._box_track.boxes
+
+    def reset_boxes(self):
+        """New episode: forget the boxes found so far (they may have been moved)."""
+        if self._box_track is not None:
+            self._box_track.reset()
+            if self.boxes_on:
+                self.boxes = self._box_track.boxes
+
+    def _boxes(self, depth):
+        """Detect the boxes in this frame (levelled pose), fuse into the episode's (BoxTracker); self.box_det = what
+        this look found (log), self.boxes = what the masks / planner use (mode on)."""
+        import time
+        if self._box_det is None:
+            return
+        t0 = time.perf_counter()
+        out = {"used": False, "why": None, "ms": 0.0, "res": None}
+        self.box_det = out
+        if not self._depth_usable(depth):
+            out["why"] = "no depth"
+        elif self.lv.get("enabled") and not self.level["used"]:
+            out["why"] = "not levelled"
+        else:
+            s = int(self.bx["subsample"])
+            d = depth[s // 2::s, s // 2::s].astype(float)
+            dlo, dhi = self.cfg["depth_range_mm"]
+            vv, uu = np.nonzero((d >= dlo) & (d <= dhi))
+            P = self._to_pelvis(uu * s + s // 2, vv * s + s // 2, d[vv, uu])
+            res = self._box_det.detect(P, self.T[:2, 3], self.scene.counter_z, self.arm_spheres)
+            out["res"], out["why"], out["used"] = res, res["why"], bool(res["boxes"])
+        res = out["res"] or {"boxes": [], "named": False, "why": out["why"]}
+        boxes = self._box_track.update(res)
+        if self.boxes_on:
+            self.boxes = boxes
+        out["boxes"], out["events"] = boxes, list(self._box_track.events)
+        out["ms"] = round(1000 * (time.perf_counter() - t0), 1)
 
     # ---------------------------------------------------------------- bin registration (x, y, yaw)
     def _init_register(self):
@@ -237,18 +308,18 @@ class Perception:
             out["used"] = True
 
     def _init_colors(self):
-        """Reference hues (OpenCV 0-180) of the object classes and of known non-objects (bins)."""
-        import cv2
+        """The world's colour classes (world_classes) until set_classes gives the episode's."""
+        self.world = world_classes(self.cfg, self.scene)
+        self.set_classes(*self.world)
 
-        def hue(rgb):
-            return float(cv2.cvtColor(np.uint8([[rgb]]), cv2.COLOR_RGB2HSV)[0, 0, 0])
-        c, sc = self.cfg.get("color") or {}, self.scene
-        refs = c.get("refs") or {k: hue(v) for k, v in sc.colors.items()}
-        rej = c.get("reject")
-        rej = [hue(sc.cfg["bins"]["rgb"])] if rej is None else list(rej)
-        self.col_names = list(refs)
-        self._hues = np.array([float(refs[k]) for k in refs] + [float(h) for h in rej], np.float32)
-        self._n_cls = len(refs)                                # classes >= _n_cls are "reject" (not an object)
+    def set_classes(self, refs, reject, alias=None):
+        """Colour classes of the geometry path: {name: [hues]} (OpenCV H 0-180; a class may have several reference
+        hues), reject hues (known non-objects: nearest -> "unknown"); alias {name: name} renames the colour-first
+        path's detections (perception.hsv keys = world classes). Per episode: colors.match_colors."""
+        names = list(refs)
+        hues = [(float(h), k) for k, n in enumerate(names) for h in refs[n]] + [(float(h), len(names)) for h in reject]
+        self._cls = (names, np.array([h for h, _ in hues], np.float32), np.array([k for _, k in hues], int))
+        self.alias = dict(alias or {})
 
     # ---------------------------------------------------------------- camera pose (levelled)
     def _to_pelvis(self, u, v, d):
@@ -289,8 +360,8 @@ class Perception:
         P = self._to_pelvis(uu * s + s // 2, vv * s + s // 2, d[vv, uu])
         # region (mat, bins) from where each pixel's ray meets the expected counter, not from its noisy 3D point:
         # selecting by noisy coordinates truncates the noise at the region edges and tilts the fit
-        pm = sc.pelvis_to_mat(np.c_[self._on_plane(np.c_[uu * s + s // 2, vv * s + s // 2].astype(float),
-                                                   sc.counter_z), np.zeros(len(uu))])
+        xy = self._on_plane(np.c_[uu * s + s // 2, vv * s + s // 2].astype(float), sc.counter_z)
+        pm = sc.pelvis_to_mat(np.c_[xy, np.zeros(len(uu))])
         W, D = sc.cfg["counter"]["mat_size"]
         m = float(L["region_margin"])
         sel = ((np.abs(P[:, 2] - sc.counter_z) <= L["band"]) & (pm[:, 0] >= m) & (pm[:, 0] <= W - m)
@@ -298,6 +369,8 @@ class Perception:
         half = np.asarray(sc.cfg["bins"]["outer_size"], float) / 2 + L["bin_margin"]
         for ctr in sc.cfg["bins"]["centers"].values():
             sel &= ~np.all(np.abs(pm[:, :2] - np.asarray(ctr, float)) <= half, axis=1)
+        if self.boxes is not self.boxes_prior:                 # + the boxes found in earlier looks (floors, walls)
+            sel &= ~self.boxes.inside_any(xy, L["bin_margin"])
         if sel.sum() < L["min_inliers"]:
             out["why"] = f"{sel.sum()} counter pixels"
             return
@@ -385,9 +458,19 @@ class Perception:
         return X, np.sqrt((W * res ** 2).sum(1) / np.maximum(ws, 1e-9)), res
 
     def masks(self, rgb):
+        """Colour-first masks: perception.hsv ranges per colour, or (color.hsv_from_classes) one mask per class of
+        the episode (set_classes), each pixel to its nearest reference hue with the geometry path's gates."""
         import cv2
         hsv = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2HSV)
         out = {}
+        if (self.cfg.get("color") or {}).get("hsv_from_classes"):
+            cl = self._cls
+            k = self._classify(hsv.reshape(-1, 3), cl).reshape(hsv.shape[:2])
+            o = int(self.cfg["open_px"])
+            for i, name in enumerate(cl[0]):
+                m = np.where(k == i, 255, 0).astype(np.uint8)
+                out[name] = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((o, o), np.uint8)) if o > 0 else m
+            return out
         for color, ranges in self.cfg["hsv"].items():
             m = np.zeros(hsv.shape[:2], np.uint8)
             for lo, hi in ranges:
@@ -404,6 +487,7 @@ class Perception:
         dets, rejected = [], []
         self._level(depth)
         self._register(depth)
+        self._boxes(depth)
         # xy_offset is tuned for the pose it is added to: registration enabled but refused on this frame -> the offset
         # measured for the levelled-only pose (register.fallback_xy_offset), if given
         fb = self.rg.get("fallback_xy_offset") if self.rg.get("enabled") and not self.reg["used"] else None
@@ -424,7 +508,7 @@ class Perception:
             n, lab, stats, cent = cv2.connectedComponentsWithStats(m, connectivity=8)
             for i in range(1, n):
                 if stats[i, cv2.CC_STAT_AREA] >= c["min_area_px"]:
-                    self._measure(color, lab, i, stats[i], cent[i], depth, dets, rejected)
+                    self._measure(self.alias.get(color, color), lab, i, stats[i], cent[i], depth, dets, rejected)
         return (dets, rejected) if debug else dets
 
     def _depth_usable(self, depth):
@@ -470,28 +554,101 @@ class Perception:
         dets.append(det)
 
     # ---------------------------------------------------------------- geometry first
-    def _classify(self, hsv):
-        """(N, 3) HSV pixels -> class index (N,): 0.. = colour class, >= _n_cls = reject hue, -1 = none (grey, dark,
-        or no reference within max_dist)."""
+    def _classify(self, hsv, cl):
+        """(N, 3) HSV pixels -> class index (N,): 0.. = colour class (nearest reference hue of any class), len(names)
+        = reject hue, -1 = none (grey, dark, or no reference within max_dist). cl = self._cls of this frame."""
         c = self.cfg["color"]
+        names, H, own = cl
         hh = hsv[:, 0].astype(np.float32)
-        dh = np.abs(hh[:, None] - self._hues[None])
+        dh = np.abs(hh[:, None] - H[None])
         dh = np.minimum(dh, 180.0 - dh)
-        dh[:, self._n_cls:] += c["reject_margin"]               # a reject hue must be clearly nearer than a class
+        dh[:, own == len(names)] += c["reject_margin"]           # a reject hue must be clearly nearer than a class
         k = dh.argmin(1)
-        ok = (hsv[:, 1] >= c["sat_min"]) & (hsv[:, 2] >= c["val_min"]) & (dh[np.arange(len(k)), k] <= c["max_dist"])
-        return np.where(ok, k, -1)
+        ok = self._chromatic(hsv) & (dh[np.arange(len(k)), k] <= c["max_dist"])
+        return np.where(ok, own[k], -1) if len(H) else np.full(len(hh), -1)
 
-    def _vote(self, cls, sat):
+    def _chromatic(self, hsv, est=False):
+        """Pixels that carry a colour: sat_min / val_min, below vote_v_max (clipped lit faces do not vote, if set);
+        est: also below clip_v (the hue estimate never uses clipped / over-exposed pixels: the clipped red channel of
+        a lit orange face reads 5-8 units too yellow)."""
+        c = self.cfg["color"]
+        vmax = c.get("clip_v", 250) if est else c.get("vote_v_max") or 256
+        return (hsv[:, 1] >= c["sat_min"]) & (hsv[:, 2] >= c["val_min"]) & (hsv[:, 2] < vmax)
+
+    def _decide(self, color, hue, cl):
+        """Per-object margin (color.obj_margin): a voted colour stands only if the blob's own hue (the estimate) is
+        nearest to that class, within max_dist, and nearer than to every other object class by obj_margin (reject
+        hues count with reject_margin, as in the vote, without the extra margin); else "unknown" (it stays and is
+        looked at again)."""
+        c = self.cfg["color"]
+        m = float(c.get("obj_margin") or 0.0)
+        if hue is None or color == "unknown" or m <= 0:
+            return color
+        names, H, own = cl
+        d = np.abs(float(hue) - H)
+        d = np.minimum(d, 180.0 - d)
+        n = len(names)
+        cls_d = np.array([d[own == k].min() if (own == k).any() else np.inf for k in range(n)])
+        rej = d[own == n].min() + c["reject_margin"] if (own == n).any() else np.inf
+        k = int(cls_d.argmin())
+        d1, d2 = cls_d[k], np.sort(cls_d)[1] if n > 1 else np.inf
+        return color if names[k] == color and d1 <= c["max_dist"] and d1 < rej and d2 - d1 >= m else "unknown"
+
+    def _vote(self, cls, sat, cl):
         """Class votes weighted by saturation (washed-out pixels count less) -> (colour name or 'unknown', winner's
         share of the vote, n classified pixels)."""
         ok = cls >= 0
         if not ok.any():
             return "unknown", 0.0, 0
-        w = np.bincount(cls[ok], weights=sat[ok].astype(float), minlength=len(self._hues))
+        w = np.bincount(cls[ok], weights=sat[ok].astype(float), minlength=len(cl[0]) + 1)
         k = int(w.argmax())
-        name = self.col_names[k] if k < self._n_cls else "unknown"
+        name = cl[0][k] if k < len(cl[0]) else "unknown"
         return name, float(w[k] / w.sum()), int(ok.sum())
+
+    def _hue(self, hsv):
+        """A blob's own colour: (hue estimate: saturation-weighted circular mean (OpenCV 0-180) of its chromatic,
+        unclipped pixels (_chromatic est) or None, their circular sd (hue units), (weight, count) histograms over the
+        180 hues of its voting pixels). The estimate is logged to tune perception.color.refs, clustered by
+        colors.Calibrator and checked by _decide; relabel() re-votes from the histograms."""
+        m = self._chromatic(hsv)
+        if not m.any():
+            return None, None, None
+        h = hsv[m, 0].astype(int)
+        hh = (np.bincount(h, weights=hsv[m, 1].astype(float), minlength=180)[:180], np.bincount(h, minlength=180)[:180])
+        e = self._chromatic(hsv, est=True)
+        if not e.any():
+            return None, None, hh
+        wh = np.bincount(hsv[e, 0].astype(int), weights=hsv[e, 1].astype(float), minlength=180)[:180]
+        a = np.arange(180) * (np.pi / 90.0)
+        x, y = (wh * np.cos(a)).sum(), (wh * np.sin(a)).sum()
+        r = min(np.hypot(x, y) / max(wh.sum(), 1e-9), 1.0)
+        sd = float(np.sqrt(-2.0 * np.log(max(r, 1e-9))) * 90.0 / np.pi)
+        return round(float(np.degrees(np.arctan2(y, x)) / 2.0) % 180.0, 1), round(sd, 1), hh
+
+    def relabel(self, dets):
+        """Re-vote the colour of geometry detections with the current classes (set_classes) from their hue histograms:
+        the same result as _vote over the blob's pixels (vote "all"), without the image. Colour-first detections and
+        perception.color.vote "top" are left as they are."""
+        c = self.cfg["color"]
+        if c.get("vote", "all") != "all":
+            return
+        cl = self._cls
+        n = len(cl[0])
+        T = self._classify(np.c_[np.arange(180), np.full(180, 255), np.full(180, max(int(c["val_min"]), 1))]
+                           .astype(np.uint8), cl)   # hue -> class (a pixel that passes the gates)
+        for d in dets:
+            hh = getattr(d, "hue_hist", None)
+            if hh is None:
+                continue
+            wh, ch = hh
+            ok = T >= 0
+            nv = int(ch[ok].sum())
+            w = np.bincount(T[ok], weights=wh[ok], minlength=n + 1)
+            k = int(w.argmax()) if nv else n
+            frac = float(w[k] / w.sum()) if nv and w.sum() > 0 else 0.0
+            d.color = (cl[0][k] if k < n and nv >= c["min_votes"] and frac >= c["min_frac"] else "unknown")
+            d.color = self._decide(d.color, getattr(d, "hue", None), cl)
+            d.color_frac, d.n_votes = round(frac if nv >= c["min_votes"] else 0.0, 3), nv
 
     def _detect_geometry(self, rgb, depth, dets, rejected):
         import cv2
@@ -512,12 +669,9 @@ class Perception:
         m = float(g["mat_margin"])
         ok = ((hm[vv, uu] >= lo) & (hm[vv, uu] <= hi) & (pm[:, 0] >= -m) & (pm[:, 0] <= W + m)
               & (pm[:, 1] >= -m) & (pm[:, 1] <= D + m))
-        bins = np.array(list(sc.cfg["bins"]["centers"].values()), float)
-        half = np.asarray(sc.cfg["bins"]["outer_size"], float) / 2
-        for ctr in bins:
-            ok &= ~np.all(np.abs(pm[:, :2] - ctr) <= half + g["bin_margin"], axis=1)
+        ok &= ~self.boxes.inside_any(P[:, :2], g["bin_margin"])
         # top higher than an object's, next to a bin: a piece of its wall (in-plane camera error moved it outside)
-        z_wall = self.height + 0.5 * (float(sc.cfg["bins"]["wall_height"]) - self.height)
+        z_wall = self.height + 0.5 * (self.boxes.min_rim() - self.height)
         cand = np.zeros((Hh, Ww), np.uint8)
         cand[vv[ok], uu[ok]] = 1
         k = int(g["fill_px"])
@@ -529,8 +683,10 @@ class Perception:
         n, lab, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
         cv_, cu_ = np.nonzero(cand)
         hsv = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2HSV)
+        cl = self._cls                 # this frame's classes (set_classes may run in another thread)
+        ncl = len(cl[0])
         cls = np.full((Hh, Ww), -1, np.int16)
-        cls[cv_, cu_] = self._classify(hsv[cv_, cu_])
+        cls[cv_, cu_] = self._classify(hsv[cv_, cu_], cl)
         blobs = []                     # (window slice, bool mask in window, class hint, split off another colour)
         for i in range(1, n):
             if stats[i, cv2.CC_STAT_AREA] < c["min_area_px"]:
@@ -539,7 +695,7 @@ class Perception:
             win = np.s_[y:y + h, x:x + w]
             comp = lab[win] == i
             cw = cls[win]
-            cnt = np.bincount(cw[comp & (cw >= 0)], minlength=len(self._hues))[:self._n_cls]
+            cnt = np.bincount(cw[comp & (cw >= 0)], minlength=ncl + 1)[:ncl]
             pres = list(np.flatnonzero(cnt >= max(cc["split_px"], cc["split_frac"] * cnt.sum())))
             if len(pres) >= 2:             # two objects: their colours' points lie ~ one size apart on the counter;
                 mw, vw = mxy[win], valid[win]   # one object with a washed-out top: top vs side face, ~ half a size
@@ -562,6 +718,8 @@ class Perception:
                 for s in range(1, ns):
                     if (sl == s).sum() >= c["min_area_px"]:
                         blobs.append((win, sl == s, j, True))
+        if (c.get("touching") or {}).get("enabled"):   # touching objects of one colour: one blob -> its objects
+            blobs = [s for bl in blobs for s in self._split_touching(bl, hm, mxy, hsv[..., 2] >= cc["val_min"])]
         glab = np.zeros((Hh, Ww), np.int32)
         f2 = self.cal.cams[self.cam].K[0, 0] * self.cal.cams[self.cam].K[1, 1]
         for win, b, j, split in blobs:
@@ -585,7 +743,7 @@ class Perception:
             area = float(b.sum()) * float(np.median(dd)) ** 2 / 1e6 / f2 / self.size ** 2
             low = int((hb[fin] <= g["support_h"] * self.height).sum())
             ztop = np.percentile(hb[fin], c["top_percentile"])
-            gap = (np.abs(np.median(mxy[win][b][fin], 0) - bins) - half).max(1).min()   # to the nearest bin, m
+            gap = float(self.boxes.gap(sc.mat_to_pelvis(np.median(mxy[win][b][fin], 0))[:2]))   # to the nearest bin, m
             why = (f"floating ({low} px near the counter)" if low < g["support_min_px"] and not split else
                    f"size {area:.2f} object areas" if not g["area"][0] <= area <= g["area"][1] else
                    f"bin wall ({1000 * ztop:.0f} mm high, {1000 * gap:.0f} mm from a bin)"
@@ -597,9 +755,9 @@ class Perception:
             if cc["vote"] == "top":
                 topf = np.zeros(len(hb), bool)
                 topf[fin] = hb[fin] >= ztop - c["top_band"]
-                color, frac, nv = self._vote(cb[topf], sb[topf])
+                color, frac, nv = self._vote(cb[topf], sb[topf], cl)
             if nv < cc["min_votes"]:
-                color, frac, nv = self._vote(cb, sb)
+                color, frac, nv = self._vote(cb, sb, cl)
             if nv < cc["min_votes"]:
                 color, frac, nv = "unknown", 0.0, nv
             elif frac < cc["min_frac"]:
@@ -613,8 +771,88 @@ class Perception:
             j2 = len(dets) + len(rejected) + 1
             glab[bv + y0, bu + x0] = j2
             st = np.array([bu.min() + x0, bv.min() + y0, bu.max() - bu.min() + 1, bv.max() - bv.min() + 1, b.sum()])
+            hue, hsd, hh = self._hue(hsv[win][b])
+            color = self._decide(color, hue, cl)
             self._measure(color, glab, j2, st, np.array([bu.mean() + x0, bv.mean() + y0]), depth, dets, rejected,
-                          {"color_frac": round(frac, 3), "n_votes": nv}, need_shape=gap < g["bin_near"])
+                          {"color_frac": round(frac, 3), "n_votes": nv, "hue": hue, "hue_sd": hsd, "hue_hist": hh,
+                           "split": int(split)},
+                          need_shape=gap < g["bin_near"])
+
+    def _split_touching(self, bl, hm, mxy, lit):
+        """A blob of touching objects (one colour: one blob in height and colour) -> one blob per object. Its upper
+        part (band x object height: the tops, no hands above) on a top-view grid (cell): count = the most of (peaks of
+        its distance transform >= r_min sizes, sep sizes apart) and (area / max_area sizes^2: no single object's
+        upper part is larger; two flush cubes have one long plateau, no second peak), capped at max_k. k > 1: k-means
+        on the grid cells from the peaks (then the farthest cells); every blob pixel goes to the nearest centre by its
+        own xy (side faces stand on their object's outline), pixels without depth to the nearest part in the image.
+        Dark pixels do not count in the upper part (a black fingertip hovering over a top is not an object).
+        Returns [(win, mask, colour class, k)] (the blob itself if k < 2)."""
+        import cv2
+        win, b, j, split = bl
+        T = self.cfg["touching"]
+        hw, mw = hm[win], mxy[win]
+        fin = b & np.isfinite(hw) & lit[win]
+        if fin.sum() < 30:
+            return [bl]
+        # scale: the blob's own top (objects are about as tall as wide; the real ones may be larger than configured)
+        zt = float(np.percentile(hw[fin], 90))
+        s = max(self.size, zt)
+        up = fin & (hw >= T["band"][0] * zt) & (hw <= zt + float(T["band"][1]))
+        if up.sum() < 30:
+            return [bl]
+        # something higher right next to it (a fingertip over the top: the notch it cuts can look like two objects;
+        # the robot's home keeps the hands out of view, the sim's hangs them over the far objects): stricter below
+        ring = cv2.dilate(b.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool) & ~b & np.isfinite(hw)
+        occl = int((ring & (hw > zt + float(self.geo["occluder_dz"]))).sum()) >= int(T["occluder_px"])
+        cell = float(T["cell"])
+        xy = mw[up].astype(float)
+        lo = xy.min(0) - 2 * cell
+        ij = np.floor((xy - lo) / cell).astype(int)
+        G = np.zeros(ij.max(0) + 3, np.uint8)
+        G[ij[:, 0], ij[:, 1]] = 1
+        G = cv2.morphologyEx(G, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        DT = cv2.distanceTransform(G, cv2.DIST_L2, 5) * cell
+        pk = np.argwhere((DT >= cv2.dilate(DT, np.ones((5, 5), np.uint8)) - 1e-9) & (DT >= T["r_min"] * s))
+        peaks = []
+        for q in pk[np.argsort(-DT[pk[:, 0], pk[:, 1]], kind="stable")]:
+            p = (q + 0.5) * cell + lo
+            if all(np.linalg.norm(p - r) >= T["sep"] * s for r in peaks):
+                peaks.append(p)
+        area = G.sum() * cell * cell / (s * s)
+        k = min(max(len(peaks), int(np.ceil(area / T["max_area"] - 1e-9))), int(T["max_k"]))
+        if k < 2 or (occl and area < T["occ_min_area"]):
+            return [bl]
+        C = (np.argwhere(G > 0) + 0.5) * cell + lo
+        cen = list(peaks[:k])
+        while len(cen) < k:
+            cen.append(C[int(np.argmax(np.min(np.linalg.norm(C[:, None] - np.array(cen)[None], axis=2), axis=1)))])
+        cen = np.array(cen)
+        for _ in range(12):
+            lab = np.argmin(((C[:, None] - cen[None]) ** 2).sum(-1), axis=1)
+            new = np.array([C[lab == q].mean(0) if (lab == q).any() else cen[q] for q in range(k)])
+            if np.abs(new - cen).max() < 1e-5:
+                break
+            cen = new
+        if occl and min(np.linalg.norm(p - q) for i, p in enumerate(cen) for q in cen[i + 1:]) < T["occ_sep"] * s:
+            return [bl]                # (an occluded single object's two lobes lie closer than two objects' centres)
+        fin = b & np.isfinite(hw)
+        pl = np.full(b.shape, -1, int)
+        pl[fin] = np.argmin(((mw[fin].astype(float)[:, None] - cen[None]) ** 2).sum(-1), axis=1)
+        hole = b & ~fin
+        if hole.any():                 # no depth: the part whose pixels (image) are nearest on average
+            yx = np.argwhere(fin)
+            cimg = np.array([yx[pl[fin] == q].mean(0) if (pl[fin] == q).any() else [1e9, 1e9] for q in range(k)])
+            hy = np.argwhere(hole)
+            pl[hole] = np.argmin(((hy[:, None] - cimg[None]) ** 2).sum(-1), axis=1)
+        out = []
+        for q in range(k):
+            n, cc, st, _ = cv2.connectedComponentsWithStats((pl == q).astype(np.uint8), connectivity=8)
+            if n < 2:
+                continue
+            part = cc == 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+            if part.sum() >= self.cfg["min_area_px"]:
+                out.append((win, part, j, k))
+        return out or [bl]
 
     def _keep_mask(self, depth):
         """uint8 mask of pixels that may belong to an object: no valid depth (unknown), or a 3D point at object
@@ -632,25 +870,20 @@ class Perception:
         vv, uu = np.nonzero(valid)
         P = self._to_pelvis(uu, vv, d[vv, uu])
         h = (P[:, 2] - sc.counter_z) / self.height
-        pm = sc.pelvis_to_mat(P)
         ok = (h >= 0.25) & (h <= c["height_range"][1])
-        half = np.asarray(sc.cfg["bins"]["outer_size"], float) / 2 + c["bin_pixel_margin"]
-        for ctr in sc.cfg["bins"]["centers"].values():
-            ok &= ~np.all(np.abs(pm[:, :2] - np.asarray(ctr, float)) <= half, axis=1)
+        ok &= ~self.boxes.inside_any(P[:, :2], c["bin_pixel_margin"])
         keep[vv[~ok], uu[~ok]] = 0
         return keep
 
     def _bin_hulls_mask(self, shape):
         """255 everywhere except inside the image hull of each bin box (footprint + margin, counter to rim)."""
         import cv2
-        sc = self.scene
+        zc = self.scene.counter_z
         keep = np.full(shape, 255, np.uint8)
-        b = sc.cfg["bins"]
-        half = np.asarray(b["outer_size"], float) / 2 + self.cfg["bin_pixel_margin"]
-        for cx, cy in b["centers"].values():
-            corners = np.array([[cx + sx * half[0], cy + sy * half[1], z] for sx in (-1, 1) for sy in (-1, 1)
-                                for z in (0.0, float(b["wall_height"]))])
-            uvz = self._project(sc.mat_to_pelvis(corners))
+        for bx in self.boxes.all():
+            xy = bx.corners(self.cfg["bin_pixel_margin"])
+            corners = np.array([[x, y, zc + z] for x, y in xy for z in (0.0, bx.rim)])
+            uvz = self._project(corners)
             if np.any(uvz[:, 2] <= 0):
                 continue
             hull = cv2.convexHull(np.round(uvz[:, :2]).astype(np.int32))
@@ -695,6 +928,11 @@ class Perception:
         m = blob & valid
         if m.sum() < s["min_px"]:
             return
+        lv = self.cfg.get("lying") or {}
+        if lv.get("enabled"):          # flat top, ridge or rounded top (lying prism / cylinder) from the height profile
+            mv, mu = np.nonzero(m)
+            if not self._lying(det, self._to_pelvis(mu + x0, mv + y0, draw[mv, mu]), lv):
+                return                 # lying (shape set) or not a flat top (shape unknown): no footprint fit
         dd, mc = draw, m
         if k > 1:                      # mean over the blob's own valid pixels (no counter / holes mixed in);
             wm = m.astype(np.float32)  # depth holes inside the blob get their neighbours' mean
@@ -781,6 +1019,87 @@ class Perception:
         if s.get("centre"):
             det.top = np.array([xc[0] + self.xy_offset[0], xc[1] + self.xy_offset[1], det.top[2]])
 
+    def _lying(self, det, P, lv):
+        """Height profile of a blob (pelvis points P (n, 3)) -> True: a flat top (go on with the footprint fit), or
+        False: a ridge (prism lying on a side: shape triangle, lying, ridge_yaw, top = ridge centre) / a rounded top
+        (cylinder on its side) / not sure (shape None). The points above h_min x the object height go into a top-view
+        grid (cell; per cell the highest point: vertical faces fold into the outline, the near slope seen well, the far
+        one at a grazing angle needs no more than a few cells) and three models are fitted to those cell heights with a
+        robust rms (1.48 x median |residual|): flat (one height), roof (two 60 deg slopes meeting in a ridge: direction
+        on a 3 deg grid, refined to 0.5 deg; ridge line from the highest cells; height free) and rounded (a horizontal
+        cylinder of the object's diameter). A model wins only by a margin (ratios) under max_rms; the side the camera
+        cannot see is not needed."""
+        cell = float(lv["cell"])
+        h = P[:, 2] - self.scene.counter_z
+        H = max(self.height, float(np.percentile(h, 98)))   # (the real objects may be larger than configured)
+        sel = h >= float(lv["h_min"]) * H
+        if sel.sum() < lv["min_px"]:
+            return True
+        xy, h = P[sel, :2], h[sel]
+        ij = np.floor((xy - xy.min(0)) / cell).astype(int)
+        uk, inv = np.unique(ij[:, 0] * (ij[:, 1].max() + 1) + ij[:, 1], return_inverse=True)
+        if len(uk) < lv["min_cells"]:
+            return True
+        hc = np.full(len(uk), -np.inf)
+        np.maximum.at(hc, inv, h)
+        cx = np.zeros((len(uk), 2))
+        np.add.at(cx, inv, xy)
+        cx /= np.bincount(inv)[:, None]
+
+        def rob(r, axis=None):
+            return 1.4826 * np.median(np.abs(r), axis=axis)
+        k, R = np.tan(np.radians(60.0)), H / 2
+        hi = hc >= np.percentile(hc, 85)
+
+        def fit(th, e, kind):
+            """Every (direction th, ridge offset e) pair at once: (rms, th, s0, height) of the best."""
+            sv = cx @ np.stack([np.cos(th), np.sin(th)])                      # (n, m)
+            s0 = np.median(sv[hi], axis=0) + e
+            d = np.abs(sv - s0)
+            drop = k * d if kind == "roof" else R - np.sqrt(np.maximum(R * R - d * d, 0.0))
+            a = np.median(hc[:, None] + drop, axis=0)
+            r = rob(hc[:, None] - (a - drop), axis=0)
+            j = int(np.argmin(r))
+            return float(r[j]), float(th[j]), float(s0[j]), float(a[j])
+        rf = float(rob(hc - np.percentile(hc, 75)))
+        out = {}
+        for kind in ("roof", "cyl"):
+            th = np.radians(np.arange(0.0, 180.0, 3.0))
+            b = fit(th, np.zeros(len(th)), kind)
+            dt, e = np.meshgrid(np.radians(np.arange(-3.0, 3.01, 0.5)), np.arange(-0.004, 0.0041, 0.001))
+            out[kind] = fit(b[1] + dt.ravel(), e.ravel(), kind)
+        rr, rc = out["roof"][0], out["cyl"][0]
+        mx = float(lv["max_rms"])
+        prof = {"rms_mm": {"flat": round(1000 * rf, 2), "roof": round(1000 * rr, 2), "round": round(1000 * rc, 2)},
+                "cells": len(uk)}
+        g = float(lv["min_gain"])      # (a small flat top fits a rounded one as well: tenths of a mm are no evidence)
+        kind = ("roof" if rr <= mx and rr <= float(lv["ratio"]) * min(rf, rc) and rf - rr >= 2 * g else
+                "cyl" if rc <= mx and rc <= float(lv["ratio"]) * min(rf, rr) and rf - rc >= g else None)
+        if kind is not None:           # enough of it: cells, and the profile across the ridge >= 0.3 heights wide
+            sv = cx @ np.array([np.cos(out[kind][1]), np.sin(out[kind][1])])
+            if len(uk) < lv["min_lying_cells"] or np.percentile(sv, 95) - np.percentile(sv, 5) < 0.3 * H:
+                prof["why"], kind = "too little of it", None
+        if kind is None and rf <= mx and rf <= float(lv["flat_ratio"]) * rr:
+            return True                # flat top: upright (cube / cylinder / triangle on a face); a small noisy flat
+                                       # top fits "rounded" about as well: only a ridge must clearly lose
+        det.fit, det.shape, det.yaw = {"profile": prof, "best": None}, None, None
+        if kind is None:               # not flat, no clear ridge / rounded top: shape unknown (never a guess)
+            return False
+        r, th, s0, a = out[kind]
+        nrm, along = np.array([np.cos(th), np.sin(th)]), np.array([-np.sin(th), np.cos(th)])
+        near = (np.abs(cx @ nrm - s0) <= 0.15 * H) & (hc >= a - 0.25 * H)   # the ridge / the top line of the cylinder
+        t = cx[near] @ along if near.sum() >= 3 else cx @ along
+        tm = 0.5 * (np.percentile(t, 2) + np.percentile(t, 98))
+        xy0 = s0 * nrm + tm * along + self.xy_offset
+        ridge = float((th + np.pi / 2 + np.pi / 2) % np.pi - np.pi / 2)
+        det.shape, det.lying, det.ridge_yaw = ("triangle" if kind == "roof" else "cylinder"), True, ridge
+        det.shape_conf = float(1.0 - r / max(min(v for kk, v in (("f", rf), ("r", rr), ("c", rc))
+                                                  if kk != kind[0]), 1e-9))
+        det.top = np.array([xy0[0], xy0[1], self.scene.counter_z + a])
+        prof.update(ridge_deg=round(float(np.degrees(ridge)), 1), length_mm=round(1000 * float(np.ptp(t)), 1))
+        det.fit = {"profile": prof, "best": det.shape}
+        return False
+
     def _disagree(self, shape, th, x, zp, top, known, x0, y0):
         """Fraction of a model footprint's pixel area contradicted by the image: top-face pixels outside it (grown
         2 px) + pixels seen to be something else (side face, counter) inside it (shrunk 2 px). Occluded = no vote."""
@@ -833,12 +1152,25 @@ class Perception:
         m = c["counter_margin"]
         if not (-m <= pm[0] <= W + m and -m <= pm[1] <= D + m):
             return "off_mat"
-        bm = c["bin_exclusion_margin"]
-        half = np.asarray(sc.cfg["bins"]["outer_size"], float) / 2 + bm
-        for name, ctr in sc.cfg["bins"]["centers"].items():
-            if np.all(np.abs(pm[:2] - np.asarray(ctr, float)) <= half):
-                return f"in_bin:{name}"
+        for bx in self.boxes.all():
+            if bx.inside(det.top[:2], c["bin_exclusion_margin"]):
+                return f"in_bin:{bx.name or 'unnamed'}"
         return None
+
+
+def world_classes(pcfg, scene):
+    """(refs {class: [hues]}, reject [hues]) of this world, OpenCV H 0-180: perception.color.refs (a hue or a list per
+    class: measured), null = scene.yaml objects.colors; reject null = scene.yaml bins.rgb."""
+    import cv2
+
+    def hue(rgb):
+        return float(cv2.cvtColor(np.uint8([[rgb]]), cv2.COLOR_RGB2HSV)[0, 0, 0])
+    c = pcfg.get("color") or {}
+    refs = c.get("refs") or {k: hue(v) for k, v in scene.colors.items()}
+    rej = c.get("reject")
+    rej = [hue(scene.cfg["bins"]["rgb"])] if rej is None else list(rej)
+    return ({k: [float(h) for h in (v if isinstance(v, (list, tuple)) else [v])] for k, v in refs.items()},
+            [float(h) for h in rej])
 
 
 def _yaw(xy):

@@ -25,7 +25,9 @@ from .test_classical import run_mock
 SC = Scene.load()
 CZ, H = SC.counter_z, SC.object_height()
 SIM = load_config(profile="sim")
-OFF = {"grasp.correct.enabled": False}
+# the correction's own mechanism: with the sag feed-forward (on in sim, test_sag.py) there would be ~nothing to correct
+NO_FF = {"sag.enabled": False}
+OFF = {"grasp.correct.enabled": False, **NO_FF}
 
 
 def det(color, x, y, shape="cylinder"):
@@ -258,10 +260,11 @@ def close_errors(env, plans):
 
 
 class TestCorrectEpisodes(unittest.TestCase):
-    """Mock world with the sim's arm sag (sag_gain): profile sim with and without the correction."""
+    """Mock world with the sim's arm sag (sag_gain): profile sim with and without the correction (sag feed-forward
+    off: the correction alone; with it, test_sag.py)."""
 
     def run_(self, seed, on, env_kw=None, ticks=None):
-        cfg = load_config(profile="sim", overrides=None if on else OFF)
+        cfg = load_config(profile="sim", overrides=NO_FF if on else OFF)
         plans = []
         pol, env, info, _ = run_mock(seed, {"sag_gain": True, **(env_kw or {})}, config=cfg, setup=_plans(plans),
                                      ticks=ticks)
@@ -324,7 +327,7 @@ class TestCorrectEpisodes(unittest.TestCase):
                 snaps.append((side, a, h, pol.queue_a.copy(), pol.queue_h.copy(), pol.corrections[-1], pol.exec_held))
             pol._correct_arm = wrapped
 
-        ticks, cfg = [], load_config(profile="sim")
+        ticks, cfg = [], load_config(profile="sim", overrides=NO_FF)   # (ticks = what was sent: intended here)
         pol, env, info, _ = run_mock(0, {"sag_gain": True}, config=cfg, setup=setup, ticks=ticks)
         self.assertEqual(info["safety_summary"]["clipped_steps"], 0)
         paired = [s for s in snaps if s[6] is not None]

@@ -14,7 +14,10 @@ Two independent signatures (separate controllers: Dex3 finger PD, arm PD), each 
   arm: max |(arm_q - held command) - SIM_SAG_GAIN * gravity torque| over the 14 joints. The sim's arm settles at
     commanded + its fitted PD sag (residual ~0.1 mrad); the real arm (other gains, no feed-forward from the runner,
     friction, or gravity feed-forward as in the teleop data) misses that model by >= 8 mrad.
-Decision (decide()): both sim -> sim; both real -> real; real + weak -> real; anything else -> sim. Why sim when in
+Decision (decide()): both sim -> sim; both real -> real; real + weak -> real; one sim + one real (contradiction) ->
+the clearer vote, if it is >= CLEAR times past its limit and >= OVER times clearer than the other (a real arm with
+well-tracking fingers: arm real x6, hand sim x1.7 -> real; a sim finger touching something: arm sim x15 -> sim);
+anything else -> sim. Why sim when in
 doubt: the sim selection comes first and decides whether the image ever reaches the robot (real config in the sim =
 much lower score = no finals); the sim's values are measured and deterministic, so a sim vote on the robot needs
 milliradian agreement with the sim's physics that real hardware does not show, while a sim episode can produce one
@@ -25,6 +28,9 @@ Per process: the world does not change, so the first episode's decision stands; 
 switch only on stronger evidence (a `confident` result, or a stronger one than the one that set the decision).
 One log line per episode: decision, both values with their thresholds and margins, and the process state.
 Before the decision act() returns the probe's targets (= holds); a policy not built yet -> holds until it is.
+Hand-over: the delegate's first act() gets the probe's last command as its start pose, and (if it has feed_probe(),
+ClassicalServerPolicy) the probe result: its still arm held at a known command is the first sample of the delegate's
+sag feed-forward estimate (result["sag"]: held command, measured arm / hand samples, arm_dq).
 """
 from __future__ import annotations
 
@@ -60,8 +66,12 @@ def margin(stat, lim, v):
     return stat / float(lim["real_min"]) if v == REAL else 0.0
 
 
-def decide(v_hand, v_arm):
-    """(world, how) from the two votes; how = confident / likely / contradiction / weak (module docstring)."""
+CLEAR, OVER = 3.0, 2.0   # a contradiction goes to the clearer vote only if its margin is >= CLEAR and >= OVER x the other's
+
+
+def decide(v_hand, v_arm, m_hand=0.0, m_arm=0.0):
+    """(world, how) from the two votes and their margins (margin()); how = confident / likely / contradiction / weak
+    (module docstring)."""
     vs = {v_hand, v_arm}
     if len(vs) == 1 and WEAK not in vs:
         return v_hand, "confident"
@@ -69,7 +79,10 @@ def decide(v_hand, v_arm):
         return REAL, "likely"
     if vs == {SIM, WEAK}:
         return SIM, "likely"
-    return SIM, "contradiction" if vs == {SIM, REAL} else "weak"
+    if vs == {SIM, REAL}:
+        (m, v), (mo, _) = sorted(((float(m_hand), v_hand), (float(m_arm), v_arm)), reverse=True)
+        return (v if m >= CLEAR and m >= OVER * mo else SIM), "contradiction"
+    return SIM, "weak"
 
 
 def soft_inside(hand_cmd, spec, pad=0.0):
@@ -165,8 +178,9 @@ class WorldProbe:
 
     def _sample(self, obs, t):
         a, h = np.asarray(obs["arm_q"], float), np.asarray(obs["hand_q"], float)
+        dq = np.asarray(obs.get("arm_dq", np.zeros(14)), float)
         if a.shape == (14,) and h.shape == (14,) and np.isfinite(a).all() and np.isfinite(h).all():
-            self.samples.append((t, a, h))
+            self.samples.append((t, a, h, dq if dq.shape == (14,) and np.isfinite(dq).all() else np.zeros(14)))
 
     def _finish(self, t):
         ac, n = self.ac, len(self.samples)
@@ -174,13 +188,16 @@ class WorldProbe:
         hs = hand_stat(h, np.repeat(self.target[None], n, 0), self.spec) if n else float("nan")
         as_ = arm_stat(a, np.repeat(self.arm[None], n, 0), h, self.kin, self.gain) if n else float("nan")
         vh, va = vote(hs, ac["hand"]), vote(as_, ac["arm"])
-        world, how = decide(vh, va)
+        world, how = decide(vh, va, margin(hs, ac["hand"], vh), margin(as_, ac["arm"], va))
         # the arm's raw static error (no model) at the start pose: on the robot the first measurement of its sag
         raw = float(np.abs((a - self.arm).mean(0)).max()) if n else float("nan")
+        # the arm held still at a known command: the delegate's first sag feed-forward sample (feed_probe)
+        sag = {"arm_cmd": self.arm.copy(), "arm_q": a, "hand_q": h,
+               "arm_dq": np.array([s[3] for s in self.samples]).reshape(-1, 14)} if n else None
         return {"world": world, "how": how, "hand": hs, "arm": as_, "arm_raw": raw, "votes": (vh, va),
                 "margins": (margin(hs, ac["hand"], vh), margin(as_, ac["arm"], va)), "n": len(self.samples),
                 "t": (self.samples[0][0] - self.t0, self.samples[-1][0] - self.t0) if self.samples else None,
-                "t_decide": t - self.t0, "ramp_ticks": self.ramp_ticks}
+                "t_decide": t - self.t0, "ramp_ticks": self.ramp_ticks, "sag": sag}
 
 
 class AutoProfilePolicy(Policy):
@@ -275,8 +292,20 @@ class AutoProfilePolicy(Policy):
         if self.reset_ep.get(world) != self.episode:
             p.reset(self.reset_args[0], task=self.reset_args[1], seed=self.reset_args[2])
             self.reset_ep[world] = self.episode
+        waiting = getattr(p, "reset_waiting", None)
+        if waiting is not None and waiting():
+            # its reset is deferred until the previous episode's planning thread has ended (ClassicalServerPolicy):
+            # hold the probe's last command meanwhile, never block (the runner's watchdog allows 1 s without a command)
+            if self.probe is None:
+                sp, self.probe = self.spec, WorldProbe(self.ac, self.kin, self.spec)
+                self.probe.last = (np.clip(np.asarray(obs["arm_q"], float), sp.arm_lower, sp.arm_upper),
+                                   np.clip(np.asarray(obs["hand_q"], float), sp.hand_lower, sp.hand_upper))
+            return self.probe.hold(int(self.ac.get("chunk", 3)))
         if not self.handed:
             self.handed = True
+            feed = getattr(p, "feed_probe", None)   # the probe's still arm -> the delegate's first sag sample
+            if feed is not None and self.probe is not None and self.probe.result is not None:
+                feed(self.probe.result)
             if self.probe is not None and self.probe.last is not None:
                 # the delegate starts from the measured pose: give it the probe's last command instead (the safety
                 # filter checks the velocity against the last COMMAND; real fingers can be the whole probe step away)

@@ -1,0 +1,10 @@
+# real_venue with the boxes' near edge 3 cm farther (0.53 m from the waist joint): the far end of the venue
+# measurement's uncertainty. Use: docker exec -e AALTO_VARIANT=real_venue_far aalto-b bash -lc "aalto sim"
+name: real_venue_far
+inherit: real_venue
+notes: real_venue with the near edge at 0.53
+
+boxes:
+  front_x: 0.53
+table:
+  x: [0.075, 0.75]   # the table's far edge moves with the boxes (they stand at it)
