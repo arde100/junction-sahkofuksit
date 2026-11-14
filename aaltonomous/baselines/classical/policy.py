@@ -1,7 +1,7 @@
-"""ClassicalPolicy: obs -> action wrapper around perception + planner (rung 1, sort_fixed).
+"""ClassicalPolicy: obs -> action wrapper around perception + planner (rungs 1-2: sort_fixed, sort_language).
 
     pol = ClassicalPolicy()                   # config.yaml, scene.yaml, calibration.yaml
-    pol.reset({"instruction": obs["instruction"]})
+    pol.reset({"instruction": obs["instruction"]})   # mapping read from the text (instruction.py); logged
     while True:
         action = pol.act(obs)                 # {"arm_q_target": (k,14), "hand_q_target": (k,14), "done": bool}
         obs, info = env.step(action)
@@ -10,6 +10,44 @@ Behaviour: go home -> settle -> look (head RGB-D) -> plan one object -> execute 
 until nothing sortable is left (then `done`). While it is planning (background thread when `threaded=True`) or
 waiting for an operator confirm, act() returns 1-tick HOLD actions (the last target), so the env's watchdog
 never fires. Targets are absolute, planned at <= motion.arm_max_vel and pre-checked against a SafetyFilter.
+
+Target bins (reset / bin_for): an explicit info["mapping"] wins, else the instruction is parsed (instruction.py:
+colour / shape / (colour, shape) / "default" keys, scene.resolve_bin rules); no instruction -> the fixed mapping. An
+object gets a bin only if every colour / shape it may have (shape None, colour "unknown" = any) leads to the same bin;
+otherwise, or if its key was not understood, it stays on the counter (0 points, not a -1 guess) and is looked at again
+in the next looks. Nothing understood -> nothing is sorted (the reset line in the log says so).
+
+Objects are tracked per object across looks (_track: same colour near the last known / attempted position), with
+a cap of policy.max_attempts tries each; untried objects go first. Grasp verification (config `verify`, sim
+profile): while a plan executes, GraspMonitor (verify.py) reads the measured finger joints once per act(); on a
+verified miss or slip the rest of that arm's queue becomes decelerate + joint-space move home (Planner.abort, own
+kinematics instance: act() runs in the control thread), and the retry uses the next grasp variant.
+
+Paired cycle (config two_arm, sim profile): after a look finds its plan as above, a second object is planned for the
+other arm from the same start pose and both run from one queue (Planner.plan_pair: the second arm delayed until the
+arms' sphere model keeps two_arm.min_clearance); verification and abort stay per arm, and an abort's new queue must
+also keep that clearance from the other arm. No pair possible -> the single plan, as before.
+
+Parked arm (config two_arm.avoid_parked, sim profile): a plan executed with one arm (no pair) is checked against the
+other arm waiting at its pose with the same model and clearance (Planner.keep_clear). Too close -> that arm moves aside
+to a two_arm.clear_poses pose and back within the same queue (Planner.evade), else the object is skipped as a failed
+plan. Aborts of such plans are checked against the other arm's queued motion as for a pair.
+
+Settle and correct (grasp.correct): every pick dwells at the grasp pose (planner phase `settle`). At its measurement
+tick (the chunk before it is cut short so that an act() lands there) the measured arm joints give the grasp point's
+tracking error (FK(commanded) - FK(measured): the PD arm sags without gravity compensation); Planner.correct shifts
+that arm's queued ticks to cancel it (blended in before the close, out after the lift starts; the other arm's
+columns untouched) if every guard passes, else the queue stays as planned. Logged as `correct <side>: ...`.
+
+Drop slots (grasp.slots): a delivered object (grasp verified held until the release; verification off: release
+executed) records its release point per bin (drops_at); the next drop into that bin takes the slot farthest from them
+(the second plan of a same-bin pair also from the first's). Failed / aborted / slipped attempts use no slot.
+
+Neighbours (config neighbours): each candidate is planned with every other detection as an obstacle. Blocked (no
+clear grasp candidate) -> the next candidate; the object is not marked failed but remembers the scene it was blocked
+in (planned again once another object moved / left). No other object plannable -> least-bad pass over the blocked
+ones (Planner.plan(least_bad=True)). Candidate order: untried first, then (neighbours.order_free) objects with free
+space around them, then policy.order.
 
 Operator confirm (real robot): ClassicalPolicy(require_confirm=True) asks before the first move to home and before
 each object; the runner calls confirm() / skip() / stop() while `pol.waiting` is True (`pol.pending_text` says what).
@@ -29,11 +67,18 @@ from aaltonomous.interface.safety import JointSpec, SafetyConfig
 from aaltonomous.scene.scene import Scene
 
 from .config import hand_postures, home_arm, load_config
+from .instruction import object_bin, parse_instruction
 from .kinematics import ArmKinematics
 from .perception import Perception
-from .planner import Planner
+from .planner import PAIR_CHECK_STEP, Planner, checked_masks, correct_ticks, held_masks
+from .verify import EMPTY, HELD, GraspMonitor, grasp_window
 
 HZ = 30.0
+MAX_ABORT_TRIES = 3  # per grasp: an abort rejected by a check (e.g. still lifting, too low) is tried again later
+
+
+def _mapping_text(m):
+    return ", ".join(f"{' '.join(k) if isinstance(k, tuple) else k}->{v}" for k, v in m.items())
 
 
 def _lower_thread_priority(nice=10):
@@ -57,6 +102,25 @@ class ClassicalPolicy:
         self.safety = safety or SafetyConfig(dt=1.0 / HZ)
         self.perception = Perception(self.cfg, self.scene, self.cal)
         self.planner = Planner(self.cfg, self.scene, self.post, self.home, self.kin, self.safety, self.spec)
+        vc = self.cfg.get("verify") or {}
+        self.verify_on = bool(vc.get("enabled"))
+        # The abort is computed inside act() (control thread) while a planning thread may be using self.planner /
+        # self.kin (pinocchio data is not thread-safe): own kinematics + planner, dry-run filter built here, not then.
+        self.abort_planner = None
+        if self.verify_on and vc.get("abort", True):
+            self.abort_planner = Planner(self.cfg, self.scene, self.post, self.home, ArmKinematics(self.cfg, self.spec),
+                                         self.safety, self.spec)
+            self.abort_planner.dry_run_safety(self.home, self.post["open"], self.home[None], self.post["open"][None])
+        # settle and correct (grasp.correct) also runs in act(): the abort's instances, or its own built the same way
+        self.correct_on = bool((self.cfg["grasp"].get("correct") or {}).get("enabled"))
+        self.act_planner = self.abort_planner
+        if self.correct_on and self.act_planner is None:
+            self.act_planner = Planner(self.cfg, self.scene, self.post, self.home, ArmKinematics(self.cfg, self.spec),
+                                       self.safety, self.spec)
+            self.act_planner.dry_run_safety(self.home, self.post["open"], self.home[None], self.post["open"][None])
+        if self._avoid_parked():
+            self.planner.clear_poses()  # bad clear poses fail here, not on the first conflict
+        self.planner.prepare()          # drop slots (reach tests) now, not in the first look
         self.require_confirm = require_confirm
         self.threaded = threaded
         if threaded:  # pure-Python planning holds the GIL: hand it back to act() sooner (default 5 ms)
@@ -70,14 +134,24 @@ class ClassicalPolicy:
         if isinstance(info, str):
             info = {"instruction": info}
         info = info or {}
-        self.mapping = info.get("mapping") or dict(FIXED_MAPPING)
+        self.mapping, self.mapping_source, self.instruction_parse, note = self._mapping(info)
         self.planner.mapping = self.mapping
         self.time_limit = info.get("time_limit", self.time_limit)
         self.state = "init"
         self.queue_a = self.queue_h = None
+        self.q_t = 0                # ticks popped from the current queue (plan tick index for the grasp monitor)
         self.arm_cmd = self.hand_cmd = None
-        self.attempts = []          # (position, count) of objects we tried to pick
-        self.failed = []            # positions whose plans failed
+        self.objs = []              # per-object records (_track): tries, verified misses / slips, deliveries, variants
+        self.execs = {}             # side -> grasp being verified in the executing plan (_watch)
+        self.exec_held = None       # executing pair: [left, right] per-tick "may hold an object" masks (abort check)
+        self.exec_masks = None      # executing plan (any): the same masks (correction's arm-arm check)
+        self.corrs = {}             # side -> pending / done settle-and-correct of the executing plan (_correct)
+        self.corrections = []       # this episode's corrections: side, error, dq, applied / why, ms
+        self.exec_parked = False    # executing a single plan with avoid_parked: aborts are checked vs the parked arm
+        self.drops = {}             # bin -> drops started this episode (cycles grasp.drop_offsets)
+        self.drops_at = {}          # bin -> release points (pelvis xy) of the objects delivered there (grasp.slots)
+        self.exec_drops = []        # executing plan: (side, bin, release xy) per pick -> bin part
+        self.exec_nb = {}           # executing plan: side -> neighbour cylinders its plan was checked against (abort)
         self.pending = None         # Plan waiting for the operator
         self.pending_text = ""      # what the operator is asked to confirm
         self.waiting = False
@@ -86,6 +160,30 @@ class ClassicalPolicy:
         self._job = None
         self._decision = None
         self.last_detections = []
+        self._note(0.0, note)
+
+    def _mapping(self, info):
+        """This episode's target bins -> (mapping, source, Parse or None, log line). An explicit info["mapping"] wins
+        (evaluator mock, tests); else info["instruction"] is parsed (instruction.py) and only what was understood is
+        used (conflicting / negated keys dropped); no or empty instruction -> the fixed rung-1 mapping. Never the fixed
+        mapping for an instruction that was not understood: under another mapping each guess scores -1, an object
+        left on the counter 0."""
+        if info.get("mapping") is not None:
+            m = dict(info["mapping"])
+            return m, "given", None, f"mapping given: {_mapping_text(m) or 'empty: sorting nothing'}"
+        text = (info.get("instruction") or "").strip()
+        if not text:
+            return dict(FIXED_MAPPING), "fixed", None, f"no instruction: fixed mapping {_mapping_text(FIXED_MAPPING)}"
+        r = parse_instruction(text)
+        what = "" if r.mapping else " -> sorting nothing"
+        return dict(r.mapping), "parsed", r, f"instruction {text!r}: {r.summary()}{what}"
+
+    def bin_for(self, d):
+        """Target bin of detection d: instruction.object_bin (scene.resolve_bin over every colour / shape the object
+        may have: shape None or colour "unknown" count as any). None = no bin for now (its key was not understood, or
+        the mapping needs the shape / colour and it is not recognised): it stays on the counter and is looked at
+        again in later looks (neighbours gone, it may be recognised then). Never a guess."""
+        return object_bin(self.mapping, d.color, getattr(d, "shape", None))
 
     def confirm(self):
         self._decision = "go"
@@ -105,6 +203,10 @@ class ClassicalPolicy:
             self.hand_cmd = np.clip(np.asarray(obs["hand_q"], float), sp.hand_lower, sp.hand_upper)
         t = float(obs.get("t", 0.0))
         if self.queue_a is not None and len(self.queue_a):
+            if self.corrs:
+                self._correct(obs, t)
+            if self.execs:
+                self._watch(obs, t)
             return self._pop()
         if self.state == "init":
             a, h = self.planner.go_to(self.arm_cmd, self.hand_cmd, self.home, self.post["open"])
@@ -151,10 +253,15 @@ class ClassicalPolicy:
             d, self._decision = self._decision, None
             if d == "go":
                 self.waiting = False
+                if t + self.pending.duration > self.time_limit:  # confirmed too late: the not-enough-time path
+                    return self._after_look(("plan", self.pending, 0), t)
                 return self._start(self.pending, t)
             if d == "skip":
                 self.waiting = False
-                self.failed.append(self.pending.waypoints["grasp"][:2])
+                for p in self.pending.parts or [self.pending]:
+                    rec = getattr(p, "rec", None)
+                    if rec is not None:  # skipped until it moves (as a plan failure)
+                        rec["failed_at"] = rec["xy"].copy()
                 self._note(t, f"operator skipped {self.pending.color}")
                 self.state = "look"
                 return self._hold()
@@ -163,7 +270,8 @@ class ClassicalPolicy:
                 self.state = "done"
                 self._note(t, "operator stop")
             return self._hold(done=self.state == "done")
-        if self.state == "executing":  # queue drained -> back home: look again after settling
+        if self.state == "executing":  # queue drained (plan or abort) -> back home: look again after settling
+            self._finish(t)
             self.state = "settle"
             return self.act(obs)
         return self._hold(done=True)
@@ -177,34 +285,140 @@ class ClassicalPolicy:
             job["result"] = ("error", repr(e))
 
     def _look(self, obs):
+        t = float(obs.get("t", 0.0))
         dets = self.perception.detect(obs["head_rgb"], obs["head_depth"])
         self.last_detections = dets
-        cands = []
-        for d in dets:
-            xy = d.top[:2]
-            if any(np.linalg.norm(xy - f) < self.cfg["policy"]["same_object_radius"] for f in self.failed):
-                continue
-            n = sum(c for p, c in self.attempts if np.linalg.norm(xy - p) < self.cfg["policy"]["same_object_radius"])
-            if n >= self.cfg["policy"]["max_attempts"]:
-                continue
-            cands.append(d)
+        recs = self._track(dets)
+        bins = [self.bin_for(d) for d in dets]
+        self._note(t, f"look: {len(dets)} detections" + "".join(  # colour:shape(x,y)=object id/tries so far->bin
+            f" {d.color}{self._shape_note(d)}({d.top[0]:+.3f},{d.top[1]:+.3f})=obj{r['id']}/{r['tries']}->{b or '-'}"
+            for d, r, b in zip(dets, recs, bins)) + self._camera_note())
+        # no bin (key not understood / shape or colour it needs not recognised): left for now, not failed
+        cands = [(d, r) for d, r, b in zip(dets, recs, bins) if b is not None and self._eligible(r, d.top[:2])]
         if self.cfg["policy"]["order"] == "nearest_bin":
             def key(d):
-                b = self.mapping.get(d.color)
-                return np.inf if b is None else np.linalg.norm(d.top[:2] - self.planner.bin_xy(b))
+                return np.linalg.norm(d.top[:2] - self.planner.bin_xy(self.bin_for(d)))
         else:
             def key(d):
                 return -d.n_px
-        cands.sort(key=key)
-        for d in cands:
-            others = [o.top[:2] for o in dets if o is not d]
-            p = self.planner.plan(d, self.arm_cmd, self.hand_cmd, obstacles=others)
+        cands.sort(key=lambda dr: (dr[1]["tries"] > 0, self._crowded(dr[0], dets), key(dr[0])))  # untried first
+        self._set_drops()
+        blocked = []
+        for d, rec in cands:
+            others = [o for o in dets if o is not d]
+            if self._same_scene(rec.get("blocked"), others):   # blocked in this very scene: planning again is moot
+                blocked.append((d, rec, others))
+                continue
+            p = self.planner.plan(d, self.arm_cmd, self.hand_cmd, bin_name=self.bin_for(d),
+                                  obstacles=[o.top[:2] for o in others], variant=self._variant(rec), neighbours=others)
             self.plans.append(p)
             if p.ok:
-                return ("plan", p, len(dets))
-            self.failed.append(d.top[:2])
+                rec["blocked"] = None
+                m = self._accept(p, d, rec, cands, t)
+                if m is not None:
+                    return ("plan", m, len(dets))
+                continue
+            if p.blocked:   # a neighbour is in the way of every candidate: take another object first
+                rec["blocked"] = np.array([o.top[:2] for o in others]).reshape(-1, 2)
+                self._note(t, f"obj{rec['id']} {d.color}: blocked ({p.reason}); other objects first")
+                blocked.append((d, rec, others))
+                continue
+            rec["failed_at"] = d.top[:2].copy()
             self.log(f"[classical] skip {d}: {p.reason}")
-        return ("none", None, len(dets))
+        m = self._least_bad(blocked, cands, t)
+        return ("none", None, len(dets)) if m is None else ("plan", m, len(dets))
+
+    @staticmethod
+    def _shape_note(d):
+        """':tri.85' = shape and its confidence (what decides a face-aligned grasp); ':?' = no shape accepted."""
+        sh = getattr(d, "shape", None)
+        return ":?" if sh is None else f":{sh[:3]}{('%.2f' % float(getattr(d, 'shape_conf', 0.0)))[1:]}"
+
+    def _camera_note(self):
+        """How the last frame was read (for the log): detection path, self-levelling and bin registration
+        corrections of the head pose, or why one was not applied. '' for a perception without them (oracle)."""
+        pc = self.perception
+        lv, rg = getattr(pc, "level", None), getattr(pc, "reg", None)
+        if not isinstance(lv, dict) or not isinstance(rg, dict):
+            return ""
+        a = (f"level {lv.get('pitch_deg', 0):+.2f}/{lv.get('roll_deg', 0):+.2f} deg {lv.get('dz_mm', 0):+.1f} mm"
+             if lv.get("used") else f"level off ({lv.get('why')})")
+        b = (f"reg {rg.get('dx_mm', 0):+.1f},{rg.get('dy_mm', 0):+.1f} mm {rg.get('dyaw_deg', 0):+.2f} deg"
+             if rg.get("used") else f"reg off ({rg.get('why')})")
+        return f"  [{getattr(pc, 'path', '?')}; {a}; {b}]"
+
+    def _accept(self, p, d, rec, cands, t):
+        """A plan found for (d, rec) at time t -> what to execute: the pair with a second object (_pair), else the
+        plan itself or its evade (_guard); None if it does not fit the time budget (rec no_time) or the parked arm
+        is in the way without an evade (rec failed_at, until it moves)."""
+        if t + p.duration > self.time_limit:  # a shorter plan of another object may still fit
+            rec["no_time"] = True
+            self._note(t, f"obj{rec['id']} {d.color}: plan {p.duration:.1f} s > {self.time_limit - t:.1f} s left")
+            return None
+        p.rec = rec
+        rest = [(d2, r2, self.bin_for(d2)) for d2, r2 in cands if r2 is not rec]
+        m = self._pair(p, rest, self.arm_cmd, self.hand_cmd, t)
+        if m is p:
+            m = self._guard(p, self.arm_cmd, self.hand_cmd, t)
+            if m is None:   # too close to the parked arm, no evade: as a failed plan (until it moves)
+                rec["failed_at"] = d.top[:2].copy()
+                return None
+            if t + m.duration > self.time_limit:
+                rec["no_time"] = True
+                self._note(t, f"obj{rec['id']} {d.color}: evade {m.duration:.1f} s > {self.time_limit - t:.1f} s left")
+                return None
+        return m
+
+    def _least_bad(self, blocked, cands, t):
+        """No other object could be planned: the blocked ones in candidate order with the least-bad rule
+        (neighbours.least_bad; Planner.plan(least_bad=True): >= neighbours.floor, the most clearance, pinch axis
+        perpendicular to the nearest neighbour first). Returns what to execute (as _accept) or None; an object with
+        no least-bad plan either stays blocked (not failed: once another object has gone, it may be clear)."""
+        if not blocked or not (self.cfg.get("neighbours") or {}).get("least_bad", True):
+            return None
+        for d, rec, others in blocked:
+            if self._same_scene(rec.get("lb_failed"), others):   # failed in this very scene already
+                continue
+            p = self.planner.plan(d, self.arm_cmd, self.hand_cmd, bin_name=self.bin_for(d),
+                                  obstacles=[o.top[:2] for o in others], variant=self._variant(rec), neighbours=others,
+                                  least_bad=True)
+            self.plans.append(p)
+            if not p.ok:
+                rec["lb_failed"] = np.array([o.top[:2] for o in others]).reshape(-1, 2)
+                self._note(t, f"obj{rec['id']} {d.color}: no least-bad plan either ({p.reason})")
+                continue
+            self._note(t, f"least-bad: obj{rec['id']} {d.color} {p.side} arm, {1000 * p.nb_clear:.0f} mm from the "
+                          f"nearest object (floor {1000 * float(self.cfg['neighbours']['floor']):.0f}); {p.reason}")
+            m = self._accept(p, d, rec, cands, t)
+            if m is not None:
+                return m
+        return None
+
+    def _crowded(self, d, dets):
+        """1 if d's nearest other detection is closer than neighbours.order_free (taken after the others), else 0."""
+        r = float((self.cfg.get("neighbours") or {}).get("order_free") or 0.0)
+        near = [np.linalg.norm(o.top[:2] - d.top[:2]) for o in dets if o is not d]
+        return int(r > 0 and bool(near) and min(near) < r)
+
+    @staticmethod
+    def _same_scene(xy, others, tol=0.01):
+        """True if the detections `others` stand where the points xy (n, 2) were (each within tol, same count)."""
+        if xy is None or len(xy) != len(others):
+            return False
+        free = list(range(len(xy)))
+        for o in others:
+            j = next((j for j in free if np.linalg.norm(xy[j] - o.top[:2]) < tol), None)
+            if j is None:
+                return False
+            free.remove(j)
+        return True
+
+    def _set_drops(self):
+        """Planner drop state for this look: grasp.drop_offsets (k-th object started into a bin: offset k) and the
+        release points of the objects delivered so far (grasp.slots)."""
+        offs = self.cfg["grasp"].get("drop_offsets") or [[0.0, 0.0]]
+        self.planner.drop_offsets = {b: offs[self.drops.get(b, 0) % len(offs)] for b in self.scene.bin_names}
+        self.planner.drop_used = {b: [np.array(p) for p in self.drops_at.get(b, [])] for b in self.scene.bin_names}
 
     def _after_look(self, res, t):
         kind = res[0]
@@ -213,14 +427,30 @@ class ClassicalPolicy:
             self.state = "done"
             return self._hold(done=True)
         if kind == "none":
-            self._note(t, f"nothing left to sort ({res[2]} detections)")
+            nb = sum(self.bin_for(d) is None for d in self.last_detections)
+            self._note(t, f"nothing left to sort ({res[2]} detections" + (f"; {nb} without a bin, left on the counter"
+                                                                          if nb else "") + ")")
             self.state = "done"
             return self._hold(done=True)
         plan = res[1]
-        if t + plan.duration > self.time_limit:
+        if plan.parts and not plan.evade and t + plan.duration > self.time_limit:  # pair no longer fits: its first
+            if not getattr(plan, "solo_ok", True):                                  # plan alone may (if clear)
+                self._note(t, f"not enough time for the pair ({plan.duration:.1f} s); {plan.parts[0].color} alone "
+                              f"comes too close to the parked arm: looking again")
+                self.state = "look"
+                return self._hold()
+            self._note(t, f"not enough time for the pair ({plan.duration:.1f} s): {plan.parts[0].color} alone")
+            plan = plan.parts[0]
+        if t + plan.duration > self.time_limit:  # (planning took time) never start a plan that cannot finish
+            rec = getattr(plan, "rec", None)
             self._note(t, f"not enough time for {plan.color} ({plan.duration:.0f} s)")
-            self.state = "done"
-            return self._hold(done=True)
+            if rec is None:
+                self.state = "done"
+                return self._hold(done=True)
+            self._register(rec)
+            rec["no_time"] = True
+            self.state = "look"  # another candidate may still fit
+            return self._hold()
         if self.require_confirm:
             self.pending, self.waiting, self.state = plan, True, "await"
             self.pending_text = plan.summary()
@@ -229,21 +459,361 @@ class ClassicalPolicy:
         return self._start(plan, t)
 
     def _start(self, plan, t):
-        xy = plan.waypoints["grasp"][:2]
-        self.attempts.append((xy, 1))
+        """Execute a single plan or a merged pair (plan.parts): per part the object's tries / variant, the drop count
+        and a grasp-verification entry for its arm (window shifted by its lag). An evade's idle part: nothing (no
+        object, no grasp)."""
+        self.execs, whos, self.exec_drops, self.exec_nb, self.corrs = {}, [], [], {}, {}
+        for p in plan.parts or [plan]:
+            if p.evade:
+                continue
+            ph = {n: (s, e) for n, s, e in p.phases}
+            if self.correct_on and p.side in ("left", "right") and "settle" in ph and "close" in ph:
+                lag = plan.lags.get(p.side, 0)   # measured where the blend-in must start (_pop ends a chunk there)
+                ramp = correct_ticks(self.cfg["grasp"]["correct"], 1.0 / HZ)[1]
+                self.corrs[p.side] = {"k_meas": ph["close"][0] + lag - ramp, "done": False,
+                                      "pose": p.arm[ph["settle"][0], ArmKinematics.sl(p.side)].copy(),
+                                      "phases": [(n, s + lag, e + lag) for n, s, e in p.phases if s >= ph["settle"][0]],
+                                      "place": p.target_bin == "counter", "nb": p.nb}
+            rec = getattr(p, "rec", None)
+            if rec is not None:
+                self._register(rec)
+                rec["tries"] += 1
+                rec["tried_xy"] = rec["xy"].copy()
+                rec["variants"].append(p.variant)
+            if p.target_bin in self.scene.bin_names:  # not a relocation ("counter")
+                self.drops[p.target_bin] = self.drops.get(p.target_bin, 0) + 1
+                if "drop" in p.waypoints:
+                    self.exec_drops.append((p.side, p.target_bin, np.asarray(p.waypoints["drop"][:2], float).copy()))
+            if p.nb is not None and p.side in ("left", "right"):
+                self.exec_nb[p.side] = p.nb
+            w = grasp_window(p.phases, p.hand, ArmKinematics.sl(p.side)) if self.verify_on and p.side else None
+            if w is not None:
+                vc, lag = self.cfg["verify"], plan.lags.get(p.side, 0)
+                self.execs[p.side] = {"rec": rec, "k_closed": w[0] + lag, "k_release": w[1] + lag, "target": w[2],
+                                      "mon": GraspMonitor(vc["after_s"], vc["empty_below"], vc["confirm"],
+                                                          vc.get("signal", "abs7")),
+                                      "verdict": "unknown", "outcome": None, "tries": 0, "done": False,
+                                      "aborted": False}
+            whos.append(("" if rec is None else f"obj{rec['id']} try {rec['tries']} ")
+                        + f"variant {p.variant} hint {p.hint}")
         self._enqueue(plan.arm, plan.hand)
+        self.exec_masks = list(held_masks(plan))
+        self.exec_held = [m.copy() for m in self.exec_masks] if plan.parts else None
+        self.exec_parked = self._avoid_parked() and not plan.parts
         self.state = "executing"
-        self._note(t, f"execute {plan.summary()}")
+        kind = "evade " if plan.evade else "pair " if plan.parts else ""
+        self._note(t, f"execute {kind}{' + '.join(whos)}: {plan.summary()}")
         return self._pop()
+
+    # ------------------------------------------------------------------ paired two-arm cycle
+    def _pair(self, first, cands, arm, hand, t):
+        """two_arm: add a second object for the other arm to `first` (a pick-to-bin plan, not a relocation / relay).
+        cands: [(det, rec, bin)] in candidate order. The first eligible one that plans with the other arm alone (from
+        the same start pose; same bin: the next drop offset), merges (Planner.pair: lag, arm-arm clearance, 0 clips)
+        and still ends before time_limit is taken; at most two_arm.max_candidates are planned (a cross-body arm/bin
+        is skipped first, free). Returns the merged Plan (parts [first, second]) or `first`."""
+        tw = self.cfg.get("two_arm") or {}
+        if (not tw.get("enabled") or first.parts or first.side not in ("left", "right")
+                or first.target_bin not in self.scene.bin_names):
+            return first
+        side = "right" if first.side == "left" else "left"
+        reach = self.cfg["grasp"].get("reach_check")
+        n, t0 = 0, time.perf_counter()
+        for d, rec, b in cands:
+            if n >= int(tw.get("max_candidates", 3)):
+                break
+            if (b not in self.scene.bin_names or rec is getattr(first, "rec", None)
+                    or not self._eligible(rec, d.top[:2])):
+                continue
+            by = self.planner.bin_xy(b)[1]
+            if (self.planner._reach_reject(d, side, b) is not None if reach  # cached IK reach test
+                    else abs(by) > 0.1 and (by > 0) != (side == "left")):     # without it: 10-30 s to fail
+                continue
+            others = [o for o in self.last_detections if o is not d]     # incl. first's object (still there at start)
+            if self._same_scene(rec.get("blocked"), others):              # blocked in this scene already (free)
+                continue
+            n += 1
+            same = b == first.target_bin
+            off = self._next_drop_offset(b) if same else None
+            avoid = [first.waypoints["drop"][:2]] if same and "drop" in first.waypoints else None
+            m, p2, why = self.planner.plan_pair(first, d, b, arm, hand, variant=self._variant(rec), drop_offset=off,
+                                                drop_avoid=avoid, neighbours=others)
+            self.plans.append(p2)
+            if m is not None and t + m.duration > self.time_limit:
+                m, why = None, f"pair {m.duration:.1f} s > {self.time_limit - t:.1f} s left"
+            if m is None:
+                self._note(t, f"pair: {self._who(rec, d)} ({side} arm) rejected: {why}")
+                continue
+            p2.rec = rec
+            dmin, k = m.clearance
+            self._note(t, f"pair: {self._who(getattr(first, 'rec', None), first)} {first.side} + {self._who(rec, d)} "
+                          f"{side}, lag {m.lags[side] / HZ:.1f} s, {m.duration:.1f} s (singles {first.duration:.1f} + "
+                          f"{p2.duration:.1f}), min clearance {1000 * dmin:.0f} mm at "
+                          f"{self.planner.where(m, k, held_masks(m), self.planner.kin)} "
+                          f"({time.perf_counter() - t0:.1f} s planning)")
+            if self._avoid_parked():  # _after_look falls back to `first` alone if the pair no longer fits: clear?
+                need = float(tw.get("min_clearance", 0.02))
+                m.solo_ok = self.planner.parked_clearance(first, stop_below=need)[0] >= need
+            return m
+        return first
+
+    def _avoid_parked(self):
+        return bool((self.cfg.get("two_arm") or {}).get("avoid_parked"))
+
+    def _guard(self, plan, arm, hand, t):
+        """two_arm.avoid_parked: `plan` (to be executed with one arm, no pair) vs the other arm parked at its pose
+        (Planner.keep_clear). Returns `plan` if clear (or the feature is off), the merged evade queue (the other arm
+        moves aside and back; it carries the plan's rec / oracle fields) or None: no evade works (logged)."""
+        if not self._avoid_parked() or plan.parts or plan.side not in ("left", "right"):
+            return plan
+        t0 = time.perf_counter()
+        m, info = self.planner.keep_clear(plan, arm, hand)
+        if m is plan:
+            return plan
+        rec, d0 = getattr(plan, "rec", None), info["parked"][0]
+        idle = "right" if plan.side == "left" else "left"
+        what = (f"{self._who(rec, plan)} {plan.side} arm -> {plan.target_bin}: {1000 * d0:.0f} mm from the parked "
+                f"{idle} arm at {info['where']}")
+        ms = 1e3 * (time.perf_counter() - t0)
+        if m is None:
+            self._note(t, f"evade: {what}; skipped, no evade ({info['why']}; {ms:.0f} ms)")
+            return None
+        e, (d, k) = m.evade, m.clearance
+        self._note(t, f"evade: {what}; {idle} arm to clear pose {e['pose']} and back at {e['back'] / HZ:.1f} s, "
+                      f"{plan.side} lag {e['lag'] / HZ:.1f} s, {m.duration:.1f} s (single {plan.duration:.1f} s, "
+                      f"+{e['added'] / HZ:.1f} s), min clearance {1000 * d:.0f} mm at "
+                      f"{self.planner.where(m, k, held_masks(m), self.planner.kin)} ({ms:.0f} ms planning)")
+        for a in ("rec", "obj", "obj_xy", "relay"):  # per-object fields of the plan (oracle: obj, obj_xy, relay)
+            if hasattr(plan, a):
+                setattr(m, a, getattr(plan, a))
+        m.parts[1].rec = None                        # the idle arm's part: no object
+        return m
+
+    @staticmethod
+    def _who(rec, d):
+        return f"{d.color}" if rec is None or rec.get("id") is None else f"obj{rec['id']} {d.color}"
+
+    def _next_drop_offset(self, b):
+        """The drop offset after the one this look uses for bin b (both objects of a pair into the same bin)."""
+        offs = self.cfg["grasp"].get("drop_offsets") or [[0.0, 0.0]]
+        cur = self.planner.drop_offsets.get(b, offs[0])
+        i = next((i for i, o in enumerate(offs) if np.allclose(o, cur)), 0)
+        return offs[(i + 1) % len(offs)]
+
+    def _pair_clear(self, side, arm, hand):
+        """An abort queue (arm, hand) of `side` while a pair / an evade executes vs the other arm's still-planned
+        motion (its held-object mask for these ticks; the aborting hand is verified empty), or (single plan with
+        avoid_parked: exec_held None) vs the parked other arm: None if the model distance stays >=
+        two_arm.min_clearance, else the reason."""
+        need = float((self.cfg.get("two_arm") or {}).get("min_clearance", 0.02))
+        if self.exec_held is None:
+            held = [np.zeros(len(arm), bool), np.zeros(len(arm), bool)]
+        else:
+            idx = np.minimum(self.q_t + np.arange(len(arm)), len(self.exec_held[0]) - 1)  # queue tick -> plan tick
+            held = [m[idx] for m in self.exec_held]
+        held[0 if side == "left" else 1] = np.zeros(len(arm), bool)
+        d, k = self.abort_planner.kin.min_arm_arm_distance(arm, hand, step=PAIR_CHECK_STEP, stop_below=need,
+                                                           with_object=checked_masks(held))
+        return None if d >= need else f"arm-arm clearance {1000 * d:.0f} mm < {1000 * need:.0f} mm in {k} ticks"
+
+    # ------------------------------------------------------------------ per-object bookkeeping
+    def _track(self, dets, commit=True):
+        """Detection -> per-object record (list aligned with dets). Same object = same `name` if the detector gives
+        one (oracle), else same colour within policy.same_object_radius of its last known or last attempted position
+        (a failed grasp pushes the object a few cm); nearest pairs first, at most one detection per record.
+        commit=False (planning ahead): new objects get records that are not stored, known ones keep their xy."""
+        r = float(self.cfg["policy"]["same_object_radius"])
+        pairs = []
+        for i, d in enumerate(dets):
+            name = getattr(d, "name", None)
+            for o in list(self.objs):
+                if name is not None and o["name"] is not None:
+                    if name == o["name"]:
+                        pairs.append((-1.0, i, o))
+                elif o["color"] == d.color and not o["delivered"]:  # delivered = in its bin: this is another one
+                    dist = min(np.linalg.norm(d.top[:2] - p) for p in (o["xy"], o["tried_xy"]) if p is not None)
+                    if dist < r:
+                        pairs.append((dist, i, o))
+        out, used = [None] * len(dets), set()
+        for _, i, o in sorted(pairs, key=lambda p: p[0]):
+            if out[i] is None and id(o) not in used:
+                out[i] = o
+                used.add(id(o))
+        for i, d in enumerate(dets):
+            if out[i] is None:
+                out[i] = {"id": None, "color": d.color, "name": getattr(d, "name", None), "xy": d.top[:2].copy(),
+                          "tried_xy": None, "tries": 0, "misses": 0, "slips": 0, "delivered": 0, "variants": [],
+                          "failed_at": None, "no_time": False, "blocked": None, "lb_failed": None}
+                if commit:
+                    self._register(out[i])
+            elif commit:
+                out[i]["xy"] = d.top[:2].copy()
+        return out
+
+    def _register(self, rec):
+        if not any(o is rec for o in self.objs):
+            rec["id"] = len(self.objs)
+            self.objs.append(rec)
+
+    def _eligible(self, rec, xy):
+        """Not out of tries / time, and no failed plan at (about) this position: a failed plan is tried again only
+        after the object moved policy.replan_moved."""
+        pc = self.cfg["policy"]
+        if rec["no_time"] or rec["tries"] >= int(pc["max_attempts"]):
+            return False
+        fa = rec["failed_at"]
+        return fa is None or np.linalg.norm(np.asarray(xy) - fa) >= float(pc.get("replan_moved", 0.03))
+
+    @staticmethod
+    def _variant(rec):
+        """Grasp variant of the next try: one step further per verified miss / slip (0 = the default order)."""
+        return rec["misses"] + rec["slips"]
+
+    # ------------------------------------------------------------------ grasp verification + abort
+    def _watch(self, obs, t):
+        """Once per act() while a plan executes. The runner asks for the next chunk while the last tick of the
+        previous one executes, so the obs reflects plan tick q_t - 2 (holds only add time: the clock is
+        conservative). Monitoring ends when the release is commanded."""
+        e = self.q_t - 2
+        for side, x in self.execs.items():
+            if x["done"]:
+                continue
+            if self.q_t >= x["k_release"]:
+                x["done"] = True
+                continue
+            cs = (e - x["k_closed"]) / HZ if e >= x["k_closed"] else None
+            v = x["mon"].update(np.asarray(obs["hand_q"], float)[ArmKinematics.sl(side)], x["target"], cs)
+            if v != x["verdict"]:
+                x["verdict"] = v
+                self._note(t, f"verify {side}: {v} sig={x['mon'].sig:.4f} ({cs:.2f} s after close)")
+            if v != EMPTY:
+                continue
+            if x["outcome"] is None:
+                x["outcome"] = "slip" if x["mon"].slipped else "miss"
+                if x["rec"] is not None:
+                    x["rec"]["slips" if x["outcome"] == "slip" else "misses"] += 1
+            self._abort(side, x, t)
+
+    def _abort(self, side, x, t):
+        if self.abort_planner is None or x["tries"] >= MAX_ABORT_TRIES:
+            x["done"] = True
+            return
+        x["tries"] += 1
+        t0 = time.perf_counter()
+        arm, hand, info = self.abort_planner.abort(side, self.arm_cmd, self.hand_cmd, self.queue_a, self.queue_h,
+                                                   neighbours=self.exec_nb.get(side))
+        if arm is not None and (self.exec_held is not None or self.exec_parked):  # keep clear of the other arm
+            why = self._pair_clear(side, arm, hand)
+            if why is not None:
+                arm, hand, info = None, None, why
+        ms = 1e3 * (time.perf_counter() - t0)
+        if arm is None:
+            self._note(t, f"abort {side} rejected ({info}; {ms:.0f} ms): plan continues"
+                          + (", retry next chunk" if x["tries"] < MAX_ABORT_TRIES else ""))
+            return
+        n = len(self.queue_a)
+        self.queue_a, self.queue_h = arm, hand  # q_t keeps counting: the other arm's columns stay tick-aligned
+        if self.exec_held is not None:          # this hand holds nothing from now on
+            self.exec_held[0 if side == "left" else 1][self.q_t:] = False
+        if self.exec_masks is not None:
+            self.exec_masks[0 if side == "left" else 1][self.q_t:] = False
+        if side in self.corrs:                  # (a pending correction of this arm has no queue left to shift)
+            self.corrs[side]["done"] = True
+        x["done"] = x["aborted"] = True
+        self._note(t, f"abort {side} ({x['outcome']}): decelerate {info['decel_ticks']} + home {info['home_ticks']} "
+                      f"ticks instead of {n} ({(n - len(arm)) / HZ:.1f} s saved, {ms:.0f} ms)")
+
+    def _finish(self, t):
+        """Queue drained: per-object outcome of the grasps that were verified; release points of the delivered
+        objects (verified held until the release, or unverified: the release was executed) -> drops_at."""
+        for side, b, xy in self.exec_drops:
+            x = self.execs.get(side)
+            if x is None or (x["outcome"] is None and x["verdict"] == HELD and not x["aborted"]):
+                self.drops_at.setdefault(b, []).append(xy)
+        self.exec_drops = []
+        for side, x in self.execs.items():
+            rec = x["rec"]
+            if x["outcome"] is None and x["verdict"] == HELD and rec is not None:
+                rec["delivered"] += 1
+            if not x["aborted"]:
+                what = x["outcome"] or ("held until the release" if x["verdict"] == HELD else "unverified")
+                self._note(t, f"{'' if rec is None else 'obj%s ' % rec['id']}{side}: {what}")
+        self.execs, self.exec_held, self.exec_parked, self.exec_masks, self.corrs = {}, None, False, None, {}
+
+    # ------------------------------------------------------------------ settle and correct (grasp.correct)
+    def _correct(self, obs, t):
+        """Once per act() while a plan executes: an arm whose settle phase has reached its measurement tick (_pop
+        ends the chunk there; the obs is ~motion lag ticks older, i.e. inside the settle, arm still) gets its
+        grasp-point tracking error measured and, if every guard passes, its queued ticks shifted (Planner.correct,
+        act()-thread planner). One _note per correction."""
+        for side, x in self.corrs.items():
+            if not x["done"] and self.q_t >= x["k_meas"]:
+                x["done"] = True
+                self._correct_arm(side, x, obs, t)
+
+    @staticmethod
+    def _correct_guard(cc, err, res, speed):
+        """grasp.correct plausibility guards on the measurement (m, m, rad/s): None or why not."""
+        if err > float(cc.get("max_err", 0.02)):
+            return f"error > max_err {1000 * float(cc.get('max_err', 0.02)):.0f} mm: something in the way?"
+        if err < float(cc.get("min_err", 0.001)):
+            return "below min_err"
+        if speed > float(cc.get("max_speed", 0.1)):
+            return f"arm still moving ({speed:.2f} rad/s)"
+        if res > 0.5 * err:
+            return f"inside the IK joint bounds {1000 * res:.1f} of {1000 * err:.1f} mm would remain"
+        return None
+
+    def _correct_arm(self, side, x, obs, t):
+        cc, sl, P = self.cfg["grasp"]["correct"], ArmKinematics.sl(side), self.act_planner
+        t0 = time.perf_counter()
+        meas = np.asarray(obs["arm_q"], float)
+        e, dq, f, res = P.correction_dq(side, self.arm_cmd, meas)
+        dec = np.array([e @ f, e @ [-f[1], f[0], 0.0], e[2]])
+        speed = float(np.abs(np.asarray(obs.get("arm_dq", np.zeros(14)), float)[sl]).max())
+        err, info = float(np.linalg.norm(e)), None
+        phases = [(n, s - self.q_t, en - self.q_t) for n, s, en in x["phases"] if en > self.q_t]
+        why = self._correct_guard(cc, err, res, speed)
+        if np.abs(self.arm_cmd[sl] - x["pose"]).max() > 1e-9:
+            why = "the arm is not at its settle pose"
+        elif not any(n == "settle" for n, _, _ in phases):
+            why = "measured after the settle phase"
+        elif why is None:
+            idx = np.minimum(self.q_t + np.arange(len(self.queue_a)), len(self.exec_masks[0]) - 1)
+            held = [m[idx] for m in (self.exec_held if self.exec_held is not None else self.exec_masks)]
+            tw = self.cfg.get("two_arm") or {}
+            need = float(tw.get("min_clearance", 0.02)) if (self.exec_held is not None or self.exec_parked) else None
+            new, info = P.correct(side, self.arm_cmd, self.hand_cmd, self.queue_a, self.queue_h, dq, phases,
+                                  place=x["place"], nb=x["nb"], held=held, pair_need=need)
+            if new is None:
+                why, info = info, None
+            else:
+                self.queue_a = new
+        ms = 1e3 * (time.perf_counter() - t0)
+        self.corrections.append({"t": t, "tick": self.q_t, "k_meas": x["k_meas"], "side": side, "err_mm": 1e3 * e,
+                                 "dec_mm": 1e3 * dec, "dq": dq.copy(),
+                                 "res_mm": 1e3 * res, "applied": why is None, "why": why, "ms": ms,
+                                 "ticks": info and info["ticks"]})
+        what = (f"applied ({info['ticks']} ticks: blend-in {info['ramp_ticks']}, out {info['blend_out_ticks']}; "
+                f"predicted residual {1000 * res:.1f} mm)" if why is None else f"refused ({why})")
+        self._note(t, f"correct {side}: grasp point {1000 * err:.1f} mm off (cmd - meas: pelvis x/y/z {1000 * e[0]:+.1f} "
+                      f"{1000 * e[1]:+.1f} {1000 * e[2]:+.1f}; along fingers {1000 * dec[0]:+.1f}, across "
+                      f"{1000 * dec[1]:+.1f}), dq max {1000 * np.abs(dq).max():.0f} mrad norm "
+                      f"{1000 * np.linalg.norm(dq):.0f}: {what}; {ms:.1f} ms")
 
     # ------------------------------------------------------------------ action plumbing
     def _enqueue(self, a, h):
         self.queue_a, self.queue_h = np.asarray(a, float), np.asarray(h, float)
+        self.q_t = 0
 
     def _pop(self):
         k = int(self.cfg["motion"]["chunk"])
+        for x in self.corrs.values():   # a chunk ends at a pending measurement tick: the next act() measures there
+            if not x["done"] and self.q_t < x["k_meas"]:
+                k = min(k, x["k_meas"] - self.q_t)
         a, h = self.queue_a[:k], self.queue_h[:k]
         self.queue_a, self.queue_h = self.queue_a[k:], self.queue_h[k:]
+        self.q_t += len(a)
         if not len(a):
             return self._hold()
         self.arm_cmd, self.hand_cmd = a[-1].copy(), h[-1].copy()

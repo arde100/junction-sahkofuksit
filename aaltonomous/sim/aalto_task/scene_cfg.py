@@ -12,6 +12,7 @@ World = pelvis frame + PELVIS_W (robot at the origin facing +x). Contents:
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -266,6 +267,20 @@ def _robot_cfg():
     cfg = G1RobotPresets.g1_29dof_dex3_base_fix(init_pos=tuple(float(v) for v in PELVIS_W),
                                                 init_rot=(0.0, 0.0, 0.0, 1.0))
     cfg.init_state.joint_pos = {**cfg.init_state.joint_pos, **ARM_HOME}
+    # Experiment hook, OUR sim only (unset = the upstream preset, which is what the organisers' sim runs: hand joints
+    # with stiffness 100 / damping 10 / armature 0.1). The real runner drives the Dex3 with kp 1.5 / kd 0.2
+    # (organisers, 2026-11-14): AALTO_HAND_GAINS="kp,kd[,armature[,effort_limit]]" lets grasps be tried with fingers
+    # that weak, e.g. "1.5,0.2,0.002,1.4". Reported by the scene service `info` (hand_gains).
+    g = os.environ.get("AALTO_HAND_GAINS")
+    if g:
+        v = [float(x) for x in g.split(",")]
+        h = cfg.actuators["hands"]
+        h.stiffness, h.damping = {".*": v[0]}, {".*": v[1]}
+        if len(v) > 2:
+            h.armature = {".*": v[2]}
+        if len(v) > 3:
+            h.effort_limit = v[3]
+        print(f"[aalto] hand actuators overridden: AALTO_HAND_GAINS={g}")
     return cfg
 
 

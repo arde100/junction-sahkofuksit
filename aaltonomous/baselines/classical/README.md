@@ -1,17 +1,32 @@
-# Classical rung-1 baseline (`sort_fixed`)
+# Classical baseline (`sort_fixed`, `sort_language`)
 
 Head RGB-D → HSV colour blobs + depth → object top centre in the pelvis frame → top-down "claw" grasp planned with
-Pinocchio IK → carry to the bin given by the mapping (rung 1: red → left, yellow → center, blue → right) → release → home → look again, until nothing sortable is left
+Pinocchio IK → carry to the object's bin (read from the instruction text; rung 1: red → left, yellow → center, blue → right) → release → home → look again, until nothing sortable is left
 (`done`). Plans are pre-checked against the safety filter (0 clips). Cross-body objects are put down where the other
-arm can finish. Rung 1 only: ignores shape and the instruction text. Meant as a floor and a code reference.
+arm can finish. Meant as a floor and a code reference.
+
+Instruction (`instruction.py`, rung 2): a rule-based reader (pure Python, no model, < 1 ms) turns the sentence into a
+`scene.resolve_bin` mapping (keys colour, shape, (colour, shape), `default`) and reports per key the bin, the clause
+it came from and a confidence, plus problems (conflicts, negation, bins without objects, unknown colours, ...). Every
+training-template sentence parses exactly; paraphrases (either order, no "bin" word, synonyms, lists, shape and mixed
+instructions, "everything else") are read by clause segmentation and pairing, not by patterns. "box(es)" = bins,
+"block(s)" = any object. An object gets a bin only if every colour / shape it may have (shape not recognised, colour
+unknown) leads to the same bin; else, or if its key was not understood or conflicts, it stays on the counter (0, not
+a -1 guess). Nothing understood -> nothing sorted; no instruction -> the fixed mapping. The reset log line says what
+was understood. Tests: `test_instruction.py` (templates, 128 development + held-back paraphrases, refusals),
+`test_classical.py TestInstructionEpisodes` (mock episodes).
 
 | File | What |
 |---|---|
 | `perception.py` | HSV masks + head depth → detections in the pelvis frame (`interface/calibration.yaml`) |
 | `kinematics.py` | Pinocchio FK/IK on the G1 URDF (`third_party/xr_teleoperate/.../g1_body29_hand14.urdf`) |
-| `planner.py` | Cartesian waypoints → 30 Hz joint trajectories, safety pre-check |
-| `policy.py` | `ClassicalPolicy`: state machine; plans in a thread and returns holds meanwhile |
+| `planner.py` | Cartesian waypoints → 30 Hz joint trajectories, safety pre-check; paired cycle (`two_arm`, sim profile): one object per arm from one look, merged with the second arm delayed until the arm-arm sphere model keeps `min_clearance`; parked arm (`two_arm.avoid_parked`, sim profile): a single-arm plan that comes too close to the waiting arm gets an evade (that arm moves to a `two_arm.clear_poses` pose and back in the same queue) or is skipped; drop slots (`grasp.slots`): reach-tested release points per bin and arm, the one farthest from what is already in the bin; neighbours (`neighbours`, sim profile): every tick keeps the arm's sphere model clear of the other objects (cylinders); face-aligned grasps (`grasp.face_align`, sim profile) from the detected shape + yaw |
+| `instruction.py` | Instruction text → mapping + evidence + problems (`parse_instruction`); one object's bin (`object_bin`) |
+| `policy.py` | `ClassicalPolicy`: state machine; target bin per object from the instruction (`bin_for`); plans in a thread and returns holds meanwhile; per-object tries; delivered objects' release points (slots); an object blocked by a neighbour waits for it, least-bad rule last |
+| `verify.py` | Grasp verification from the finger joints (`verify`, sim profile): a verified miss / slip aborts the carry |
+| settle and correct | `grasp.correct` (on, base and sim): the arm dwells at the grasp pose (phase `settle`), the policy measures the grasp point's tracking error (FK of measured vs commanded joints: the PD arms sag ~8 mm without gravity compensation) and shifts that arm's queued ticks to cancel it before the hand closes (`Planner.correction_dq` / `correct`, every guard or the queue stays as planned; log line `correct <side>: ...`); tests `test_correct.py` |
 | `policy_server.py` | The same policy behind the submission protocol (port 8000) = **reference submission** |
+| `autoprofile.py` | One image for the sim selection and the robot finals (`AALTO_PROFILE=auto`, the image default): at the start of every episode a 0.6 s probe (arms held where measured, fingers curled 0.2 rad) tells the Isaac sim from the real G1 by two signatures, finger error at rest (sim < 1 mrad, real >= 48 mrad) and arm error vs the sim's sag model (sim ~0.1 mrad, real >= 8 mrad); the episode then runs on profile `sim` or `none` (both built at start-up). When in doubt: `sim`. One log line per episode (`autoprofile ep N: ...`); tests `test_autoprofile.py` |
 | `config.yaml` | Everything tunable (HSV ranges, grasp, home pose, speeds, hand postures); `profiles.sim` = sim-tuned overrides |
 | `run.py`, `sim_eval.py`, `mock_world.py` | In-process runs: mock world / real robot, Isaac sim scoring, rendered mock |
 
@@ -36,8 +51,14 @@ looser IK/clearances, shorter holds. (5) 6-tick hold chunks while planning + a l
 command rate stays at 30 Hz under CPU load.
 
 **Sim-tuned (profile `sim`, the default; `AALTO_PROFILE=none` or `run.py --backend real` = robot base values):**
-home pose, speeds/accelerations, holds, counter clearance 2 cm, IK tilt 35 deg / joint step 0.6. The HSV floor,
+home pose, speeds/accelerations, holds, counter clearance 2 cm, IK tilt 35 deg / joint step 0.6, and the oracle's
+planner features (joint-space carry first, 1 cm segment shortcut, no bin margin, cached arm-vs-bin reach test),
+face-aligned grasps (shape + yaw from perception, `shape_conf >= 0.6`) and neighbour-aware plans (5 mm sphere-model
+margin). Drop slots (`grasp.slots`) are on in the base config too: they are derived from `scene.yaml` + the configured
+reach (switch off -> `grasp.drop_offsets` as before). The HSV floor,
 grasp point and `open` posture are in the base config but were also only checked in the sim.
+Tests of these: `test_grasp_plan.py`. Unit tests run on profile `sim_legacy` (`sim` + the grasp they were written
+for, settle and correct off; also for sim A/B runs), `TestSimProfile*` and `test_correct.py` on `sim`.
 
 ## Run it
 
@@ -59,5 +80,8 @@ Real robot (organisers only, robot on the gantry, operator confirms every object
 aaltonomous.baselines.classical.run --backend real --network-interface <iface>` (see `run.py --help`).
 
 Server env vars: `AALTO_TIME_LIMIT` (s, default 120; the policy skips an object it can't finish in time),
-`AALTO_ARM_VEL` (overrides `motion.arm_max_vel`), `AALTO_PROFILE` (config profile, default `sim`). Calibration and `config.yaml` are baked into the image:
-rebuild after changing them.
+`AALTO_ARM_VEL` (overrides `motion.arm_max_vel`), `AALTO_PROFILE` (config profile; unset = the file's `sim`; `auto` =
+detect sim / robot per episode, the image's default; any explicit profile, e.g. `docker run -e AALTO_PROFILE=sim`,
+forces it without detection). Calibration and `config.yaml` are baked into the image: rebuild after changing them.
+Mock worlds that imitate either world's joint signatures: `make_mock_env(world="sim" | "real")` (`mock_world.py`
+`SIM_WORLD` / `REAL_WORLD`: finger no-load error, thumb_0 bias, lag, the runner's arm gains without feed-forward).

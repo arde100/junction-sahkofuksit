@@ -1,0 +1,34 @@
+# Stress DR for accepting changes (not a guess at any held-out config: simply wider than train.yaml on every knob,
+# from our own judgement of how far a venue + printed parts + a hand-calibrated camera can be from the nominal sim).
+# Use: AALTO_DR=/data/aaro/junction-sahkofuksit/aaltonomous/sim/dr/aaro_stress.yaml aalto sim
+# Schema + semantics: aaltonomous/sim/aalto_task/dr.py. train.yaml values in the trailing comments.
+name: aaro_stress
+lighting:
+  key_intensity_scale: [0.4, 1.8]       # train [0.6, 1.4]: dim hall light .. a spot right above the table
+  key_pos_jitter: [0.8, 0.8, 0.5]       # train [0.4, 0.4, 0.3]: shadows from any side
+  key_rgb_jitter: 0.15                  # train 0.08: warm / cool lamps
+  dome_intensity_scale: [0.3, 2.0]      # train [0.5, 1.5]
+  dome_rgb_jitter: 0.10                 # train 0.05
+textures:
+  mat_scale: [0.65, 1.25]               # train [0.8, 1.15]: print brightness
+  mat_rgb_jitter: 0.10                  # train 0.06
+  mat_bias: [-0.06, 0.06]               # train [-0.03, 0.03]
+  counter_rgb_jitter: 0.35              # train 0.2
+  bin_rgb_jitter: 0.15                  # train 0.08: orange boxes drifting towards red / yellow
+objects:
+  hue_jitter: 0.035                     # train 0.02 (turns; 0.035 = 12.6 deg): filament batch
+  sat_scale: [0.65, 1.2]                # train [0.8, 1.15]
+  val_scale: [0.65, 1.2]                # train [0.8, 1.15]
+  mass_scale: [0.5, 2.0]                # train [0.7, 1.5]: 25 g (sparse infill) .. 100 g (solid PLA) on nominal 50 g
+  friction_scale: [0.5, 1.15]           # train [0.75, 1.1]: smooth PLA on hard fingertips
+pose:
+  xy_jitter: 0.010                      # train 0.005: staff placing objects from a card
+  yaw_jitter_deg: 10                    # train 5
+camera:
+  rgb_noise_std: 6.0                    # train 3.0
+  rgb_gain: [0.8, 1.2]                  # train [0.9, 1.1]: auto exposure
+  depth_noise_mm: 2.0                   # train 1.0
+  depth_noise_rel: 0.004                # train 0.002
+  depth_hole_frac: 0.04                 # train 0.01
+  pose_jitter_m: 0.015                  # train 0.01: head extrinsics from the URDF, not calibrated
+  pose_jitter_deg: 1.5                  # train 1.0

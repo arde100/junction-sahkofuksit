@@ -1,0 +1,5 @@
+# As aaro_lowfric.yaml, at the low end of train.yaml: friction x0.75, mass x1.5 for every object.
+name: aaro_midfric
+objects:
+  friction_scale: [0.75, 0.75]
+  mass_scale: [1.5, 1.5]

@@ -23,12 +23,17 @@ COPY third_party/xr_teleoperate/assets/g1/g1_body29_hand14.urdf third_party/xr_t
 COPY aaltonomous/__init__.py aaltonomous/
 COPY aaltonomous/deploy/__init__.py aaltonomous/deploy/protocol.py aaltonomous/deploy/policy_server.py aaltonomous/deploy/
 COPY aaltonomous/interface/__init__.py aaltonomous/interface/safety.py aaltonomous/interface/calibration.py \
-     aaltonomous/interface/joint_spec.yaml aaltonomous/interface/calibration.yaml aaltonomous/interface/
+     aaltonomous/interface/tasks.py aaltonomous/interface/joint_spec.yaml aaltonomous/interface/calibration.yaml \
+     aaltonomous/interface/
 COPY aaltonomous/scene/__init__.py aaltonomous/scene/scene.py aaltonomous/scene/scene.yaml aaltonomous/scene/
 COPY aaltonomous/baselines/__init__.py aaltonomous/baselines/
 COPY aaltonomous/baselines/classical/*.py aaltonomous/baselines/classical/config.yaml aaltonomous/baselines/classical/
-# Load-time check at build: config, URDF and calibration parse (fails the build, not the run).
-RUN python3 -c "from aaltonomous.baselines.classical.policy_server import ClassicalServerPolicy; ClassicalServerPolicy()"
+# One image for the sim selection and the robot finals: the server detects which world it runs in at the start of
+# every episode and uses that world's config profile (autoprofile.py; config.yaml `autoprofile`). `docker run -e
+# AALTO_PROFILE=sim` (or none, ...) forces a profile without detection.
+ENV AALTO_PROFILE=auto
+# Load-time check at build: config, URDF and calibration parse, both worlds' policies build (fails the build, not the run).
+RUN python3 -c "from aaltonomous.baselines.classical.policy_server import make_policy; assert make_policy().wait_ready(300)"
 
 EXPOSE 8000
 CMD ["python3", "-m", "aaltonomous.baselines.classical.policy_server"]

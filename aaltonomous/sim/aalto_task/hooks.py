@@ -130,7 +130,8 @@ class AaltoRuntime:
             return {"ok": True, "active": self.place(env, req["layout"]), "layout": req["layout"]}
         if cmd == "info":
             d = None if not self.dr_cfg else {"name": self.dr_cfg.get("name"), "path": self.dr_cfg["_path"]}
-            return {"ok": True, "dr": d, "ports": self.ports, "n_objects": len(self.names), **self.clock_info()}
+            return {"ok": True, "dr": d, "ports": self.ports, "n_objects": len(self.names),
+                    "hand_gains": os.environ.get("AALTO_HAND_GAINS") or None, **self.clock_info()}
         if cmd == "randomize":
             return {"ok": True, "params": self.randomize(env, req.get("seed"))}
         if cmd == "reset_random":

@@ -1,0 +1,6 @@
+# Grasp robustness check for the grasp lab (not a visual DR): every object slippery and heavy, nothing else changed.
+# Use: AALTO_DR=<path to this file> aalto sim, then grasp_lab --randomize 0. Nominal friction 1.2 / 1.0, mass 50 g.
+name: aaro_lowfric
+objects:
+  friction_scale: [0.5, 0.5]            # train.yaml goes down to 0.75, aaro_stress to 0.5
+  mass_scale: [2.0, 2.0]                # 100 g (solid PLA)

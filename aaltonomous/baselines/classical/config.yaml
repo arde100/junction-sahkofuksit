@@ -4,13 +4,95 @@
 # the right hand is mirrored automatically (sign flip, index/middle swapped) unless `right:` is given.
 #
 # PROFILES: the values below are the robot-side defaults; `profiles.<name>` (dotted keys, bottom of this file)
-# override them. `profile: sim` = tuned in the Aalto Isaac sim (what the reference image scores with). Select
-# with $AALTO_PROFILE (e.g. AALTO_PROFILE=none = base values only); run.py --backend real uses `none` unless
-# --profile is given. Re-tune the sim values on the real robot before using them there (M8).
+# override them. `profile: sim` = tuned in the Aalto Isaac sim. Select with $AALTO_PROFILE (e.g. AALTO_PROFILE=none =
+# base values only); run.py --backend real uses `none` unless --profile is given. AALTO_PROFILE=auto (the image's
+# default): the policy server detects sim / real robot per episode (`autoprofile` below) and uses `sim` / `none`;
+# anything else that loads the config under `auto` gets this file's default. Re-tune the sim values on the robot (M8).
 profile: sim
 
 perception:
   camera: head
+  # Self-levelling (perception._level): the counter plane is fitted to every depth frame and the head extrinsics are
+  # corrected in roll, pitch and height so it lies at scene.counter_z, level (yaw / in-plane shift stay as calibrated).
+  level:
+    enabled: true
+    subsample: 4              # fit on every 4th pixel / row
+    band: 0.05                # m: pixels whose calibrated height is within this of counter_z (near counter: ~3 deg +
+                              # 2 cm of extrinsics error)
+    region_margin: 0.0        # m inside the mat edges
+    bin_margin: 0.03          # m around the bin footprints (walls, shadows)
+    ransac_iters: 64
+    inlier_thr: 0.008         # m (RANSAC), then trimmed LS at max(trim_k * robust sd, min_thr)
+    trim_k: 2.5
+    min_thr: 0.002
+    min_inliers: 800          # subsampled pixels; fewer (hands / objects over the mat, no depth) -> calibration as is
+    min_inlier_frac: 0.5
+    max_tilt_deg: 5.0         # larger corrections are not believed (calibration as is)
+    max_dz: 0.04
+    max_rms: 0.006            # m
+  # Bin registration (perception._register): camera x, y, yaw from the bin walls in the levelled depth. Only valid
+  # where the bins are fixed in the pelvis frame (the sim: its DR jitters the camera, not the bins). OFF on the robot
+  # (boxes placed by hand); on in profiles.sim.
+  register:
+    enabled: false
+    subsample: 2              # every 2nd pixel / row ...
+    max_points: 3000          # ... wall points, evenly thinned to at most this many
+    h_lo: 0.015               # m above the counter: wall points from here (bin floors, counter below) ...
+    h_hi_margin: 0.006        # ... to the rim + this
+    max_shift: 0.04           # m: search range of the camera xy correction (and its guard)
+    max_yaw_deg: 3.0          # search range of the yaw correction (and its guard)
+    yaw_step_deg: 1.0         # coarse yaw grid
+    cell: 0.004               # m: coarse xy grid (also the nearest-wall lookup)
+    coarse_r: 0.008           # m: soft wall width in the coarse search
+    iters: 6                  # fine: trimmed Gauss-Newton on point-to-wall-line distances
+    inlier_thr: 0.008         # m, first fine iteration; then max(trim_k * robust sd, min_thr)
+    trim_k: 2.5
+    min_thr: 0.002
+    min_points: 300           # wall points / inliers needed
+    min_inlier_frac: 0.3
+    min_dir_points: 60        # inliers on x-facing and on y-facing walls each (else x or y is not observed)
+    min_bin_points: 30        # every bin whose rim centre is in the image needs this many inliers on its x-facing
+                              # and on its y-facing walls (a moved / missing bin -> guard)
+    max_rms: 0.004            # m
+    fallback_xy_offset: null  # xy_offset used instead of perception.xy_offset on frames where registration is
+                              # enabled but its guard refused the fit (xy_offset is tuned for the registered pose)
+  # Geometry first (perception._detect_geometry): objects = depth pixels in a height band over the mat; colour only
+  # classifies. false = the HSV-first path below (also used whenever depth is missing / too sparse).
+  geometry_first: true
+  geometry:
+    height_band: [0.25, 1.6]  # object heights above the (levelled) counter: candidate pixels (hands are higher; sim
+                              # home-pose fingertips dip into it over the far objects: occluder_dz cuts them off)
+    mat_margin: 0.03          # m around the mat
+    bin_margin: 0.008         # m around the bin footprints (in-plane camera error moves the walls; layout objects'
+                              # edges are >= 4.5 cm from them)
+    bin_near: 0.04            # m: a blob this close to a bin footprint is a piece of its wall (in-plane camera error
+                              # shifted it out of the footprint) if its top is above (object + wall) / 2 or no object
+                              # shape fits it (layout object centres are >= 7 cm from the bins)
+    need_level: true          # levelling enabled but not used on this frame -> colour first (an unlevelled counter
+                              # rises into the height band)
+    fill_px: 5                # closing that fills depth holes inside a candidate (hole pixels only)
+    occluder_dz: 0.004        # m: pixels this far above the blob's own-colour top face are something over it (finger)
+    support_h: 0.6            # object heights: a standing object shows pixels below this (its near side face) ...
+    support_min_px: 20        # ... at least this many; else a top-face piece cut off by a finger, or a hovering thing
+    area: [0.15, 6.0]         # blob area (fronto-parallel equivalent at its range) in size^2: one object ~1.2-1.9,
+                              # far objects mostly hidden by a fingertip (sim home pose) down to ~0.25
+  color:                      # classification of geometry blobs: nearest reference hue (OpenCV H 0-180)
+    refs: null                # {class: hue}; null = scene.yaml objects.colors (red 0, yellow 25, blue 113)
+    reject: null              # hues that are NOT objects (nearest = "unknown"); null = scene.yaml bins.rgb (12)
+    reject_margin: 4          # a reject hue wins only when this much nearer than the nearest class: red keeps
+                              # H <= 8 (as the old HSV range), yellow H >= 16.5; the boxes' 12 stays "unknown"
+    sat_min: 50               # greyer / darker pixels do not vote (counter, black hand, glare)
+    val_min: 40
+    max_dist: 18              # hue units (x2 = deg) to the nearest reference, else no vote
+    vote: all                 # all = every blob pixel votes (weight = saturation); top = the top face (whole blob if
+                              # it has < min_votes classified pixels). Lit tops wash out (sim stress light, real yellow
+                              # tops H 45-49 vs sides 24): the side faces carry the colour more reliably
+    min_votes: 30             # fewer classified pixels -> "unknown"
+    min_frac: 0.5             # winner's share of the (weighted) votes below this -> "unknown"
+    split_px: 80              # a second colour with this many pixels ...
+    split_frac: 0.2           # ... and this share of the blob's votes splits it (two objects touching) ...
+    split_dist: 0.6           # ... if the two colours' 3D points are >= this many sizes apart (else: a washed-out
+                              # top vs its side face, one object)
   # OpenCV HSV (H 0-180, S/V 0-255). Each colour = list of [lo, hi] ranges (red wraps around H=0).
   hsv:
     # S min 70: lit TOP faces are washed out (sim: S ~95 red/blue, ~123 yellow vs ~150 on the side faces). With
@@ -34,6 +116,25 @@ perception:
   object_size: null           # null = scene.yaml objects.size (grasp width)
   xy_offset: [0.0, 0.0]   # pelvis-frame xy added to every detection (head extrinsics correction). TUNE on the robot
   object_height: null         # null = scene.yaml size * height_ratio
+  shape:                      # shape + yaw from the top face (perception._fit_shape); enabled false = shape-agnostic
+    enabled: true
+    smooth_px: 5              # box filter on the blob's depth before the height test (depth noise)
+    band: 0.003               # m: top-face pixels = smoothed height within this of the top plane
+    open_px: 3                # opening of the top-face mask (speckle)
+    min_px: 150               # fewer valid depth pixels in the blob: no fit
+    shrink: 0.001             # m: expected uniform shrink of the outline vs the model footprint (pixel centres)
+    shrink_tol: 0.002         # m: prior sd of that shrink (object size is known: "size nearly fixed")
+    rms_ref: 0.001            # m: support-function residual the prior is weighed against
+    occluder_px: 3            # outline points within this of something higher than the top face are "occluded"
+    occluder_dz: 0.005        # m above the top plane that counts as an occluder (hand, finger)
+    min_free: 0.5             # fraction of the 360 directions not occluded below this -> shape None
+    max_rms: 0.003            # m: best model fits worse than this -> shape None
+    min_conf: 0.5             # 1 - rms(best) / rms(runner-up) below this -> shape None (sim: right fits ~0.85)
+    fill: [0.15, 1.3]         # visible top-face area / model area outside this -> None (merged blobs, slivers)
+    max_bad: 0.1              # fitted footprint vs pixels: contradicted area fraction above this -> None (and None
+                              # whenever another shape's footprint is contradicted less)
+    centre: true              # shape found: detection xy = fitted footprint centre instead of the weighted mean of the
+                              # top-face points (that mean is pulled ~3 mm towards the camera by the side faces)
 
 grasp:
   # Grasp = "claw from above": palm faces the counter (approach axis = palm -y on the LEFT hand, mirrored right),
@@ -48,16 +149,49 @@ grasp:
     - [1.0, 0.0, 0.0]
     - [1.0, -1.0, 0.0]
     - [0.0, -1.0, 0.0]
+  extra_hints: []             # tried after finger_hints only (never rotated by a retry variant); same mirroring
   finger_hint_weight: 0.3
   height_frac: 0.5            # grasp point z = counter + height_frac * object size (before fingertip check)
   fingertip_clearance: 0.012  # fingertips (preshape posture, URDF) stay this far above the counter at grasp
   approach_height: 0.08       # pregrasp = grasp point this far above the grasp height
   carry_height: 0.16          # grasp point z above the counter while carrying (clears bin walls + object)
   drop_inset: 0.05            # release this far inside the inner walls at the box point nearest the pelvis (null = centre)
+  drop_offsets: [[0.0, 0.0]]  # pelvis xy added to the drop point; k-th object into a bin uses offset k % n (no stacking)
+                              # (used only when slots.enabled is false)
+  # Drop slots (planner._make_slots): per (bin, arm) release points in rows along the bin's near wall, inside the
+  # inner footprint inset by wall_clear, reach-tested (IK from home at carry + drop height, tilt <= max_tilt_deg).
+  # Row 0: 1 + floor(reachable width / min_spacing) points spread evenly; row 1: staggered, min_spacing diagonally.
+  # Each drop takes the slot farthest from the objects DELIVERED to that bin this episode (a failed / aborted /
+  # slipped attempt uses none; oracle: the objects really lying there). Scene boxes 21 x 21 cm: row 0 at x 0.443,
+  # side bins y +-0.198 / +-0.260 / +-0.322, centre bin -0.062 / 0 / +0.062; row 1 at x ~0.494 (2 more per arm).
+  slots:
+    enabled: true
+    wall_clear: 0.04          # slot centre to the inner wall (object half size 22.5 mm + ~1.7 cm drop scatter)
+    min_spacing: 0.06         # between slots (cube 45 mm, any yaw: no overlap above 64 mm, touching faces at 45)
+    rows: 2
+    count: 5                  # slots kept per (bin, arm), farthest-first
+    max_tilt_deg: 10          # reach test: approach-axis tilt allowed at the slot (carry and drop height)
+  # Face-aligned grasp (planner.face_dirs; was the oracle's): with a known shape + yaw, the fingers point along the
+  # outward normal of one flat face (cube) / at triangle_phi_deg from an apex (triangle), thumb opposite; tried before
+  # finger_hints, faces nearest the arm's natural direction first (variant k: rotated by k, then the hints rotated).
+  # Detection yaw convention (perception / oracle): cube face normals at yaw + k*90, triangle apexes at yaw + 90 + k*120.
+  face_align:
+    enabled: false
+    cube: true
+    triangle: true
+    triangle_phi_deg: 105     # finger direction vs an apex (sim grasp_test: 105 best; 60 = fingers on a face)
+    finger_ref_deg: {left: -25.0, right: 25.0}   # natural finger direction (pelvis yaw: forward, slightly inward)
+    max_dev_deg: 75           # faces further than this from it are not tried
+    hint_weight: 3.0          # IK weight of the finger direction (finger_hint_weight 0.3 = a weak preference)
+    tol_deg: 12               # the IK must reach the direction this closely, else the candidate is dropped
+    min_conf: 0.0             # Detection.shape_conf below this -> stock hints (the oracle's detections have 1.0)
+    carry_weight: null        # IK weight of the finger direction from the lift on (carry, drop, retreat). null = as
+                              # at the grasp (hint_weight): the hand keeps the grasp's direction all the way to the bin
   drop_above_rim: 0.04        # grasp point above bin rim + object half size when releasing
   retreat_up: 0.08            # then a joint-space move home: start it high enough to clear the bin rims
   release_posture: release     # hand posture for letting go (hand.<name>); back to `open` on the way home
   arm: by_y                   # by_y = preferred arm first (bin side; centre bin: object side), other on failure | best = plan both, keep the faster
+  reach_check: false          # skip an arm at once if IK cannot put its grasp point above the bin at carry height
   relocate:                   # cross-body: no arm can do object -> bin; pick with one arm, put down where the other can finish
     enabled: true
     max_spots: 6              # counter spots tried (nearest the target bin first)
@@ -65,9 +199,52 @@ grasp:
     clearance: 0.07           # spot centre this far from other detected objects
   y_split: 0.0
   arm_xy_offset: {left: [0.0, 0.0], right: [0.0, 0.0]}   # per-arm grasp xy correction (pelvis frame). TUNE on the robot
+  # Settle and correct (planner phase `settle`, policy._correct): the arms are PD-controlled without gravity
+  # compensation, so the hand sags below its command. After `descend` the arm dwells at the grasp pose (hand still
+  # preshaped); at the end of that dwell the policy compares FK of the MEASURED arm joints with FK of the commanded ones
+  # and shifts that arm's queued ticks (damped least squares on the grasp point + the palm's commanded orientation)
+  # so the measured grasp point lands on the planned one: blended in before the close, held through the close and
+  # hold_lift_s of the lift, blended out after (never faster than motion.arm_max_vel). Refused (queue untouched,
+  # logged) if a guard fails. Robot-agnostic (only measured joints): on here, with conservative settle / lag values.
+  # Sim replay 2026-11-14 (68 grasps): the grasp point was 11 mm (p90 14) off at the stop: 8 mm low, 4 mm short
+  # along the fingers, up to 10 mm sideways; free settling leaves p90 0.9 mm drift after 0.2 s, 0.4 mm after 0.3 s.
+  correct:
+    enabled: true
+    settle_s: 0.3             # dwell before the measurement (arm stationary)
+    obs_lag: 3                # ticks the observation in act() lags the queue (sim runner: 2); part of the dwell
+    ramp_s: 0.2               # blend-in, ends where the close starts (phase settle = settle + lag + ramp)
+    hold_lift_s: 0.1          # correction kept this long into the lift (object lifts off where it was pinched) ...
+    blend_out_s: 0.2          # ... then blended out over at least this long (longer where the speed limit needs it)
+    min_err: 0.001            # m: smaller errors are left alone
+    max_err: 0.02             # m: larger = something in the way (the hand rests on an object / rim): refused
+    max_dq: 0.05              # rad per joint (sim replay: <= 28 mrad at <= 20 mm)
+    max_speed: 0.1            # rad/s: measured joint speed above this = arm not settled: refused
+    rot_weight: 0.3           # m/rad of the palm's orientation error (to the commanded orientation) in the DLS
+    damping: 0.01
+
+# Neighbour-aware plans: every other detected object = a vertical cylinder on the counter (radius = its shape's
+# circumradius: cube 31.8 mm, cylinder 22.5, triangle 30; unknown shape 31.8; height = object height). Every tick of a
+# plan (to_pregrasp ... home; relocation place; abort move home; evade moves) keeps the arm's sphere model
+# (kinematics.ARM_SPHERES: forearm + Dex3, ~13 mm conservative) >= margin from each (or no closer than at its start
+# pose, if that is already closer). The object being picked is exempt. A blocked candidate (finger direction / face /
+# arm) is rejected and the next one tried; no candidate clear -> the policy takes other objects first (the object
+# is not marked failed; planned again once the other objects moved / left); nothing else plannable -> least-bad:
+# >= floor, most clearance over all candidates of both arms, pinch axis perpendicular to the nearest neighbour first;
+# none -> it stays blocked. No relocation for a blocked object. Off here; on in profile sim.
+neighbours:
+  enabled: false
+  margin: 0.01                # m, sphere model to cylinder
+  floor: -0.005               # m, least-bad rule: lowest accepted (the model's ~13 mm slack: about touching)
+  least_bad: true             # false: a blocked object waits (or is skipped) instead
+  least_bad_good: 0.0         # least-bad search stops at the first plan this far (m, model) from every neighbour
+  extra_dirs: true            # all candidates blocked / failed: also try the fingers towards the nearest neighbour
+  extra_within: 0.12          # (the thumb hangs 5-8 cm behind the grasp point) and the two pinch axes perpendicular
+                              # to it, if it is within this distance (m, centres)
+  order_free: 0.0             # m: objects whose nearest neighbour is closer than this go after the others (0 = off)
 
 ik:
   limit_margin: 0.08          # rad inside URDF limits (safety filter clips beyond 0.05)
+  joint_margin: {}            # per-joint margin instead (key = joint name without side and `_joint`, e.g. wrist_roll)
   pos_tol: 0.006
   max_tilt_deg: 25            # approach axis vs straight down
   orient_weight: [0.3, 0.1, 0.03]   # tried in turn: top-down first, then trade tilt (<= max_tilt) for reach
@@ -83,12 +260,16 @@ motion:
   hand_max_vel: 1.2           # rad/s (filter allows 3.0)
   cart_step: 0.02             # Cartesian segments are split into IK waypoints this far apart
   max_joint_step: 0.4         # rad between neighbouring Cartesian IK waypoints (more = branch flip, bisect / fail)
+  shortcut_tol: null          # m: a Cartesian segment becomes ONE joint-space move if the grasp point stays this close
+                              # to the line (per-waypoint IK can let wrist yaw wander: longer joint paths). null = off
+  joint_carry_first: false    # carry lift -> above bin: joint space first, Cartesian as fallback (false = the reverse)
   close_hold_s: 0.4           # wait after the hand reaches the closed posture
   open_hold_s: 0.4
   settle_s: 0.5               # hold at home before looking (arm lag, motion blur)
   chunk: 10                   # ticks returned per act() (0.33 s)
   hold_ticks: 6               # ticks per hold while planning / waiting (fewer requests; <= 0.2 s extra latency)
   counter_clearance: 0.03     # hand points above the counter footprint stay this high during transit
+  bin_margin: 0.01            # m around a bin's outer footprint where hand points must stay above its rim
 
 # Arms out of the head camera's view of the cube region and above counter height. TUNE on the robot
 # (start = where teleop leaves the arms; the first move goes there at arm_max_vel).
@@ -109,13 +290,94 @@ hand:                          # LEFT order: thumb0, thumb1, thumb2, middle0, mi
                                                          # stayed hooked in half-bent fingers with `open`/`preshape`)
   right: null                  # optional explicit right-hand postures {open, preshape, closed} in RIGHT DDS order
 
-policy:
-  max_attempts: 2             # same object re-detected after this many tries -> skip it
-  same_object_radius: 0.03
-  order: nearest_bin          # nearest_bin | largest
+# Which right-hand joint each of the 7 right-hand command slots drives, as indices into the spec's right-hand names
+# (joint_spec.yaml: thumb 0-2, index 0-1, middle 0-1). null = the spec's order. Only the kinematic model uses it
+# (clearance checks, sphere model, fingertips); commands and observations are passed through unchanged.
+right_hand_slots: null
 
-# Overrides per profile (dotted keys). `sim` = Aalto Isaac sim, ported from the oracle's ORACLE_OVERRIDES
-# (sim/oracle.py) minus anything privileged; SIM-TUNED, not validated on the robot.
+policy:
+  max_attempts: 2             # tries per object (same object across looks: same colour within same_object_radius)
+  same_object_radius: 0.03    # m from the object's last known or last attempted position (a missed grasp pushes it)
+  replan_moved: 0.03          # an object whose plan failed is planned again only after it moved this far
+  order: nearest_bin          # nearest_bin | largest (objects not tried yet always come before retries)
+
+# Grasp verification (verify.py): sig = max |measured - commanded| finger joint of the grasping hand while the closed
+# posture is commanded; fingers on an object stop short of it. A real hand has a no-load error: measure it before
+# enabling this on the robot. Off here; profile sim has the sim thresholds.
+verify:
+  enabled: false
+  after_s: 1.0                # no verdict earlier than this after the closed posture is first fully commanded
+  signal: finger_shortfall    # abs7 = max |error| of all 7 joints | finger_shortfall = closing shortfall of the 4 finger
+                              # joints (verify.grasp_signal). Real hand at kp 1.5 (data drop 1, teleop grasps): thumb_0
+                              # has a constant no-load error of 0.075 rad; fingers alone: held 0.13-0.37, empty 0.013-0.043
+  empty_below: 0.09           # rad: sig below this = empty hand ... (0.09 = from that real data, NOT yet tried with our
+                              # own closed posture on the robot; the sim values are in profile sim)
+  confirm: 2                  # ... on this many consecutive observations (one per act(), i.e. per motion.chunk)
+  abort: true                 # on a verified miss / slip: decelerate + joint-space move home, then look again
+
+# Paired cycle: from one look, one object per arm, both executed from one queue (planner.plan_pair). The second arm
+# starts after the first lag at which the arms' sphere model (kinematics.ARM_SPHERES: forearms + Dex3 + 40 mm per held
+# object; never optimistic vs the URDF meshes, typically 13 mm conservative) stays min_clearance apart, checked at every
+# tick. NOTHING else checks arm vs arm (the safety filter does not, and the Aalto sim does not simulate arm-arm contact
+# at all: a pair that "works" in the sim proves nothing about clearance). Off here; on in profile sim.
+two_arm:
+  enabled: false
+  min_clearance: 0.02         # m, model distance between the two arms (+ held objects) at every checked tick
+  lag_step_s: 0.5             # second arm's start delay is tried at 0, 0.5, 1.0, ... s
+  lag_cap_frac: 0.6           # ... up to this fraction of the first plan's duration (later saves little over two plans)
+  max_candidates: 3           # second objects planned per look (a cross-body arm/bin is skipped without planning)
+  # Parked arm (independent of `enabled`): every plan executed with ONE arm (single pick, relocation, oracle relay; its
+  # abort) is checked against the other arm waiting at its pose, with the same model, min_clearance and held object.
+  # The sim home holds both hands above the object band: a cross-body pick overlaps the parked hand by up to 47 mm.
+  # Too close -> that arm moves to the first clear pose that works, waits and returns, in the same queue (planner
+  # evade: the plan delayed by 0, lag_step_s, ... <= lag_cap_frac; the return as early as the clearance allows);
+  # none works -> the object is skipped until it moves. Off here; on in profile sim.
+  avoid_parked: false
+  # Clear poses: LEFT arm 7-vectors (right arm mirrored: roll / yaw joints flip sign), tried in order. Chosen
+  # 2026-11-14 from a 1400-pose joint grid (sim home + sim joint margins): the idle arm parked there keeps >= 20 mm
+  # (first: 49 mm) from every cross-body plan over the band (x 0.26-0.33, y to -0.17) and the relay places; 0.7 s from
+  # the sim home, so the evade never delayed a pick (lag 0, no added time, 64/64 conflicts) offline. Hand out + up
+  # (first: grasp point ~(0.33, 0.22, 0.38)); arm meshes >= 41 mm from torso / head on the way (as at home).
+  clear_poses:
+    - [-0.3, 0.9, 0.4, -0.3, 0.0, 0.0, 0.0]
+    - [0.3, 0.6, 0.4, -0.3, 0.0, 0.0, 0.0]    # (lower, further out: 20 mm static margin)
+
+# World detection (autoprofile.py): the policy server with AALTO_PROFILE=auto (the image's default) probes at the start
+# of every episode whether it runs in the Aalto Isaac sim or on the real robot and delegates to the policy built with
+# that world's profile. Not affected by `profiles` (read from the base values). Measured 2026-11-14 (see autoprofile.py):
+#   hand = max |measured - commanded| over the 14 Dex3 joints, probe posture held: sim fingers (stiffness 100) settle
+#     to 0.0003 rad (median, 94k still frames inside the soft limits); real (kp 1.5, teleop data drop 1, 203 still
+#     windows) never below 0.048 (left thumb_0 bias, 0.02-0.06 no-load error per finger joint).
+#   arm = max |(measured - commanded) - sim_sag_gain * gravity torque| over the 14 arm joints, arm held: sim 0.0001 rad
+#     (median, 8940 still frames); real (teleop, gravity feed-forward on) never below 0.0076 (3239 frames, 20
+#     episodes). The runner sends no feed-forward (backends.py) at arm kp 80 / wrist kp 40: ~3.5-10x the sim's sag.
+autoprofile:
+  profiles: {sim: sim, real: none}   # world -> config profile of the policy used there (none = the base values)
+  every_episode: true         # probe every episode (~0.6 s); false: only until the first decision
+  # LEFT order, right mirrored. Index = middle (the sim and the robot wire the right hand's index / middle
+  # differently), thumb_0 = 0 (mirror conventions differ); inside the sim's soft limits (middle 90 % of the URDF range)
+  # by >= 0.1 rad, so the sim's fingers can reach it. From open: fingers curl 0.2 rad (less than every `open`).
+  hand_probe: [0.0, 0.0, 0.2, -0.2, -0.2, -0.2, -0.2]
+  hand_vel: 1.2               # rad/s (filter 3.0): from the measured start pose, >= min_ramp_ticks
+  min_ramp_ticks: 5
+  # Measurement from max(arm_settle_s, ramp end + hand_settle_s) after the first observation, for window_s (and
+  # >= min_samples observations; decision at ~0.6 s): sim arm = damped oscillation (6.1 Hz, decay 8.3/s, fitted on
+  # 110 episode starts): a held 12 mrad step leaves <= 1.1 mrad from 0.4 s; sim fingers 0.37 s after a 2.5 rad/s move
+  # <= 0.0024 rad (114 episode starts), error ~ speed (first-order, tau 0.09 s + 2 ticks obs lag).
+  arm_settle_s: 0.45
+  hand_settle_s: 0.3
+  window_s: 0.1
+  min_samples: 2
+  max_s: 2.0                  # decide with what there is by then (slow runner)
+  chunk: 3                    # ticks per act() while probing (a sample per call; the runner's calls take ~0.1 s wall)
+  hand: {sim_max: 0.012, real_min: 0.025}    # rad: below = sim vote, above = real vote, between = weak
+  arm: {sim_max: 0.003, real_min: 0.006}
+  # = mock_world.SIM_SAG_GAIN (rad/Nm per arm joint, LEFT order, same for the right arm)
+  sim_sag_gain: [-0.00362, -0.00346, -0.00354, -0.00280, -0.00077, -0.00286, -0.00242]
+
+# Overrides per profile (dotted keys; `inherit: <profile>` = that profile's keys first, then these). `sim` = Aalto
+# Isaac sim, ported from the oracle's ORACLE_OVERRIDES (sim/oracle.py) minus anything privileged; SIM-TUNED, not
+# validated on the robot.
 profiles:
   sim:
     # Home = the sim task's ARM_HOME (sim/aalto_task/layout.py; arms down, elbows bent), the pose the evaluator
@@ -123,6 +385,21 @@ profiles:
     # perception error ~4 mm). The robot default home above keeps them out of view.
     home_arm_q: [0.0, 0.35, 0.0, -0.5, 0.0, 0.0, 0.0,
                  0.0, -0.35, 0.0, -0.5, 0.0, 0.0, 0.0]
+    # sim home pose: the fingertips hang over the far left / right objects. 150 recorded frames (+ train / stress
+    # camera noise): 0 wrong shapes at 0.35, shape found for 94 % of the objects (88 % at 0.5)
+    perception.shape.min_free: 0.35
+    # the sim's DR moves the head camera, never the bins: register x, y, yaw on them (off on the robot)
+    perception.register.enabled: true
+    # what levelling + registration leave on the 150 nominal frames (fitted centres, mean of -3.4, -1.2 mm): the sim's
+    # head camera / pelvis is not exactly where calibration.yaml + scene.yaml put it in a way the counter and the bins
+    # do not explain (eval_perception, 2026-11-14)
+    perception.xy_offset: [0.0034, 0.0012]
+    # ... and what levelling alone leaves there (fitted centres +1.9, +4.4 mm), for frames the registration refuses
+    perception.register.fallback_xy_offset: [-0.0019, -0.0044]
+    # the bins are excluded by geometry (registered pose), so the bin-hue reject only has to catch the bin colour
+    # itself: 150 frames under the train randomisation: 3 of 200 red objects (hue jittered towards orange) were
+    # "unknown" (= never sorted) at margin 4, none at 8, still no extra detection
+    perception.color.reject_margin: 8
     motion.arm_max_vel: 0.97      # safety filter allows 1.0
     motion.arm_max_acc: 8.0
     motion.hand_max_vel: 2.5      # filter allows 3.0
@@ -133,3 +410,119 @@ profiles:
     motion.max_joint_step: 0.6
     ik.max_tilt_deg: 35
     ik.random_restarts: 4
+    # The sim's arm joints stop short of the URDF limits (measured 2026-11-14 on 20000 ticks: wrist roll +-1.78 of
+    # +-1.97, wrist pitch +1.455 of 1.61, elbow -0.886 of -1.05). IK solutions on the old bound (limit - 0.08) were
+    # never reached: the hand arrived tilted / up to 3-4 cm off. Keep the IK ~0.03 rad inside what the sim reaches.
+    # Rule behind it (found later the same day): the sim's robot config has soft_joint_pos_limit_factor = 0.9, every
+    # joint only reaches the middle 90 % of its URDF range (margin 5 % of the range: shoulder pitch 0.29, roll 0.19,
+    # yaw 0.26, elbow 0.16, wrist roll 0.20, wrist pitch / yaw 0.16; an oracle grasp commanded wrist yaw 1.53 and sat
+    # 0.08 rad short). + ~0.02 rad on every joint. The fingers have the same soft limits (see hand.* below).
+    ik.joint_margin: {shoulder_pitch: 0.31, shoulder_roll: 0.21, shoulder_yaw: 0.28, elbow: 0.19,
+                      wrist_roll: 0.22, wrist_pitch: 0.19, wrist_yaw: 0.18}
+    # Thumb-opposed pinch (sim grasp lab 2026-11-14, exact pose, both hands: cube 12/12, cylinder 12/12, aligned
+    # triangle 18/20; the base postures: 11/12, 12/12, triangle <= 7/20; hand self-lift at the close 0-2 mm instead of
+    # 7-14): thumb_0 turns the thumb to sit directly opposite the index finger, the middle finger stays straight,
+    # the grasp point lies on the thumb-index line. Every joint is inside the sim's soft limits (thumb_0 +-0.94,
+    # fingers no straighter than -0.079 / -0.087: a posture beyond them never arrives and reads as a held object).
+    # hand.right is explicit because the SIM wires the right hand as thumb 0-2, middle [3, 4], index [5, 6] (upstream
+    # action_provider_dds.py; joint_spec.yaml says index [3, 4]) and does not mirror thumb_0: [3, 4] = the straight
+    # finger, [5, 6] = the closing one. SIM ONLY: on the robot the wiring must be checked and the squeeze (kp 1.5
+    # fingers) needs a much deeper closed posture.
+    hand.open:     [-0.94, -0.25, 1.35, -0.08, -0.09, -0.4, -0.4]
+    hand.preshape: [-0.94, -0.25, 1.35, -0.08, -0.09, -0.4, -0.4]
+    hand.closed:   [-0.6, 0.15, 0.95, -0.08, -0.09, -1.0, -0.6]
+    hand.release:  [-0.94, -0.25, 1.35, -0.08, -0.09, -0.08, -0.09]
+    hand.right:
+      open:     [-0.94, 0.25, -1.35, 0.08, 0.09, 0.4, 0.4]
+      preshape: [-0.94, 0.25, -1.35, 0.08, 0.09, 0.4, 0.4]
+      closed:   [-0.6, -0.15, -0.95, 0.08, 0.09, 1.0, 0.6]
+      release:  [-0.94, 0.25, -1.35, 0.08, 0.09, 0.08, 0.09]
+    # Where the object's centre sits in the palm at the close. [0.084, -0.086, 0.0285] (midway between the closed
+    # thumb and index tips) was the commanded point while this pinch was tuned, but the arm then sagged ~5.5 mm low
+    # and ~4 mm short of every command, so the object really sat at (88, -80.5) mm. With grasp.correct the hand goes
+    # where it is told, so the point is that place (lab 2026-11-14, correction on: aligned triangles 20/20 vs 18/20
+    # without the correction; cylinders 16/16).
+    grasp.point_in_palm: [0.088, -0.0805, 0.0285]
+    # the SIM's right-hand wiring for the kinematic model: slots [3, 4] drive the middle finger, [5, 6] the index
+    # (without this the model has the curled and the straight finger of the right hand swapped: right-arm plans next
+    # to the bins were rejected where the mirrored left-arm plans passed)
+    right_hand_slots: [0, 1, 2, 5, 6, 3, 4]
+    # last-resort finger directions (LEFT arm; right mirrors y): forward-outward. An object that slipped out of the hand
+    # during a carry lands in front of the bins (x 0.36-0.38), where forward / inward fingers cross a bin's front wall.
+    # Planning-level map 2026-11-14 (3 shapes, both arms): with these the strip plans everywhere on the arm's own
+    # side except right at the centre bin's corners (x 0.38, y 0); without them only its inner half.
+    grasp.extra_hints: [[1.0, 1.0, 0.0], [1.0, 2.0, 0.0]]
+    # planner features (as the oracle's): shorter joint paths, fast reject of cross-body arms, no stacked drops
+    motion.shortcut_tol: 0.01
+    motion.joint_carry_first: true
+    motion.bin_margin: 0.0        # far object row is ~3 cm from the centre bin wall: 1 cm rejected forward hands
+    grasp.reach_check: true
+    grasp.drop_offsets: [[0.0, 0.0], [0.03, 0.03], [-0.03, -0.03], [0.03, -0.03], [-0.03, 0.03]]   # (slots off)
+    grasp.face_align.enabled: true    # perception's shape + yaw (150 recorded frames: no wrong shape, yaw < 10 deg)
+    grasp.face_align.min_conf: 0.6    # right fits ~0.85 in the sim; weaker ones get the stock hints
+    # with the thumb-opposed pinch (grasp lab): triangles with the fingers towards an apex 18/20 (stock hints 9/12;
+    # 20/20 with grasp.correct). Cubes: aligned to a face normal. Unaligned they held 12/12 in the first sweep (up to
+    # 30 deg off a face, exact pose, no correction), but 54 % per attempt cross-body in the train-randomised
+    # evaluations, 9/12 cross-body in the lab once grasp.correct put the hand exactly on target (all 3 failures at
+    # 30 deg), and a 45 deg cube failed cross-body without it; aligned: 16/16 (own side and cross-body, 0-45 deg).
+    grasp.face_align.triangle_phi_deg: 0
+    grasp.face_align.cube: true
+    # from the lift on the finger direction is only a weak preference (= finger_hint_weight): planning-level grid of
+    # triangle poses, 56 cases: 14 lost their aligned grasp to "carry: no joint-space path above the bin rim" with
+    # the direction kept
+    grasp.face_align.carry_weight: 0.3
+    neighbours.enabled: true
+    neighbours.margin: 0.005
+    # least-bad (last resort when nothing else can be planned; else the object stays on the counter: 0 points).
+    # -12 mm in the sphere model is about touching (the model is ~6 mm conservative + up to 9 mm for a cube's
+    # circumradius), but with that floor an object whose neighbour can never be removed (it keeps slipping, or has no
+    # bin) was never attempted (mock seed 2, neighbour 8.2 cm away: -17 mm for every candidate). -25 mm: attempt it
+    # anyway with the candidate that has the most clearance. With the thumb-opposed pinch the rule is cheap (50
+    # sampled layouts, planning level, 2026-11-14: plans whose hand model enters a neighbour 23 % -> 1 %, 10 objects
+    # waited, 1 least-bad, pairs 45 -> 41, +0.7 s per layout); with the old postures (thumb far behind the grasp
+    # point) it blocked 27 % of the objects at the first look.
+    neighbours.floor: -0.025
+    neighbours.order_free: 0.07       # layouts keep 8 cm: only pushed objects are crowded
+    # grasp verification + retries (sim, 51 grasps with ground truth: sig 1 s after the close >= 0.016 held,
+    # <= 0.004 empty; replayed at chunk granularity every miss was flagged 1.3-1.6 s after the close, no hold)
+    verify.enabled: true
+    verify.after_s: 1.0
+    verify.signal: abs7               # sim fingers (stiffness 100) have no no-load error: all 7 joints, 259 grasps checked
+    verify.empty_below: 0.008
+    verify.confirm: 2
+    policy.max_attempts: 5
+    policy.same_object_radius: 0.06   # a missed grasp pushes the object 2-3 cm
+    two_arm.enabled: true             # paired two-arm cycle (offline mock only so far; min_clearance as base)
+    two_arm.avoid_parked: true        # single-arm plans keep clear of the parked arm (evade, else skip)
+    # settle and correct: the sim runner's observation lags 2 ticks; free settling leaves p90 0.9 mm after 0.2 s.
+    # Dwell 6 + 2 + 4 ticks = 0.4 s per grasp.
+    grasp.correct.enabled: true
+    grasp.correct.settle_s: 0.2
+    grasp.correct.obs_lag: 2
+    grasp.correct.ramp_s: 0.13
+    # 0.2 s after the stop some joint of the sim arm still moves at 0.12-0.15 rad/s (first lab run: all 12
+    # corrections refused at the base 0.1); corrected then, the error at the close is 0.3-2 mm instead of 6.5-9 mm
+    grasp.correct.max_speed: 0.4
+  # The sim profile with the grasp used until 2026-11-14 (base hand postures, grasp point between thumb and one
+  # finger, IK margins on wrist roll / pitch + elbow only, cubes face-aligned, triangles at 105 deg) and that day's
+  # neighbour values: what the unit tests' mock geometry (seeds, pair / evade / abort / slot expectations) was written
+  # for; the mechanism tests run on it (test_classical / test_two_arm / test_grasp_plan), so tuning `sim` does not
+  # move them. Also usable for A/B runs in the simulator: AALTO_PROFILE=sim_legacy.
+  sim_legacy:
+    inherit: sim
+    hand.open:     [0.0, -0.5, 1.5, -0.4, -0.4, -0.4, -0.4]
+    hand.preshape: [0.0, -0.5, 1.5, -0.4, -0.4, -0.4, -0.4]
+    hand.closed:   [0.0, -0.1, 1.2, -1.0, -0.6, -1.0, -0.6]
+    hand.release:  [0.0, -0.5, 1.5, -0.05, -0.05, -0.05, -0.05]
+    hand.right: null                  # mirrored
+    grasp.point_in_palm: [0.099, -0.084, 0.015]
+    ik.joint_margin: {wrist_roll: 0.22, wrist_pitch: 0.19, elbow: 0.19}
+    grasp.face_align.triangle_phi_deg: 105
+    grasp.face_align.cube: true
+    neighbours.margin: 0.005
+    neighbours.floor: -0.012
+    neighbours.order_free: 0.07
+    grasp.extra_hints: []             # (sim adds finger directions for objects in front of the bins)
+    grasp.face_align.carry_weight: null   # (the hand keeps the grasp's finger direction to the bin, as it did)
+    right_hand_slots: null            # (index and middle get the same values in these postures: no difference)
+    grasp.correct.enabled: false      # (the mock tests' timing / seeds predate the settle phase; own tests on sim)

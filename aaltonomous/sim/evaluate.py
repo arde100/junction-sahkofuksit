@@ -211,7 +211,7 @@ def evaluate(a):
                      "dr_params": dr}
             if a.policy == "oracle":
                 trial["mapping_source"] = pol.mapping_source
-                trial["oracle_events"] = pol.events[-40:]
+                trial["oracle_events"] = pol.events[-300:]   # the policy logs looks + verification now: 40 no longer covers an episode
             trial["gate_ok"], trial["gate_why"] = gate_ok(trial, a.gate_max_clips, a.gate_min_hz)
             if events or summary.get("end_reason") != "done":
                 trial["safety_events"] = events[:20]
