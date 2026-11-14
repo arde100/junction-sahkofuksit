@@ -508,7 +508,9 @@ motion:
   settle_s: 0.5               # hold at home before looking (arm lag, motion blur; real torso camera: within 0.5 px
                               # 0.2-0.5 s after the arms stop)
   chunk: 10                   # ticks returned per act() (0.33 s)
-  hold_ticks: 6               # ticks per hold while planning / waiting (fewer requests; <= 0.2 s extra latency)
+  hold_ticks: 6               # ticks per hold while planning / waiting (fewer requests; <= 0.2 s extra latency).
+                              # (10 was tried on 2026-11-14 for the sim gate's policy_hz_rt: ticks per call rose
+                              # only from ~8.9 to ~9.2, scores within noise: not taken)
   counter_clearance: 0.03     # hand points above the counter footprint stay this high during transit
   bin_margin: 0.01            # m around a bin's outer footprint where hand points must stay above its rim
 

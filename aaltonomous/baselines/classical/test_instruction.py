@@ -565,6 +565,28 @@ class TestStayAndExcept(unittest.TestCase):
         self.assertEqual(r.mapping, {"red": L, "cube": R})
         self.assertEqual(parse_instruction("The left and right bins are for red.").mapping, {})   # (as before)
 
+    def test_trailing_except_after_the_bin(self):
+        """'everything ... in the right box, apart from / except X': X stays (it went to the default's box before:
+        -1 per object); an explicit bin for X still wins."""
+        for text, m in (("Place all items into the right box, apart from the yellow ones.", {"default": R, "yellow": N}),
+                        ("Put everything in the right box excluding the purple cubes.",
+                         {"default": R, ("purple", "cube"): N}),
+                        ("Put everything in the centre bin apart from the yellow ones and the cubes.",
+                         {"default": C, "yellow": N, "cube": N}),
+                        ("Put everything in the right box, except for the yellow ones.", {"default": R, "yellow": N}),
+                        ("Put everything in the right box, except for the yellow ones, which go left.",
+                         {"default": R, "yellow": L}),
+                        ("Put everything in the right box except the yellow ones. The yellow ones go left.",
+                         {"default": R, "yellow": L})):
+            with self.subTest(text=text):
+                r = parse_instruction(text)
+                self.assertEqual(r.mapping, m)
+                self.assertTrue(r.ok, r.problems)
+
+    def test_ramp_is_a_prism(self):
+        self.assertEqual(parse_instruction("Put the ramps in the middle tray and the cans on the right.").mapping,
+                         {"triangle": C, "cylinder": R})
+
 
 class TestUnread(unittest.TestCase):
     """A word in object position the lexicon cannot read: that phrase gives no key, and every key that could take its

@@ -115,7 +115,7 @@ _SHAPE = {"cube": ("cube", 1), "cubes": ("cube", 1), "cuboid": ("cube", 1), "cub
           "tubes": ("cylinder", 1),
           "triangle": ("triangle", 1), "triangles": ("triangle", 1), "triangular": ("triangle", 0),
           "prism": ("triangle", 1), "prisms": ("triangle", 1), "wedge": ("triangle", 1), "wedges": ("triangle", 1),
-          "pyramid": ("triangle", 1), "pyramids": ("triangle", 1)}
+          "pyramid": ("triangle", 1), "pyramids": ("triangle", 1), "ramp": ("triangle", 1), "ramps": ("triangle", 1)}
 # more shape words (cheap and unambiguous; principle: an unread word in object position is never guessed, see _unread)
 _SHAPE.update({"boxy": ("cube", 0), "blocky": ("cube", 0), "cuboidal": ("cube", 0), "barrel": ("cylinder", 0),
                "barrels": ("cylinder", 1), "tubular": ("cylinder", 0), "cylindric": ("cylinder", 0),
@@ -745,6 +745,7 @@ class _Reader:
         self.problems = []
         self.last_bin = None       # bin of the last pairing ("the same bin", "too")
         self.prev_pend = []        # objects the previous sentence left without a bin ("The red ones? Left.")
+        self.given = set()         # id() of every phrase give() gave a bin (_unbound: a trailing "except X")
         self.header = None         # a bin heading a list on the next lines ("Left bin:\n- red\n- blue")
         self.neg_keys = []         # keys named in negated clauses
         self.unread = []           # phrases with an unread word in object position (result: what they could overlap)
@@ -767,6 +768,19 @@ class _Reader:
             for o in objs:
                 for k in o.keys():
                     self.assigned.setdefault(k, []).append(("?stay", self.text[a:b].strip(), 1.0))
+
+    def _unbound(self, objs):
+        """Objects left without a bin: a warning, except phrases excepted from a default phrase that got a bin
+        ("put everything in the right bin, except the yellow ones": the X clause has no bin of its own) -> '?except'
+        (they stay unless another clause gives them a bin)."""
+        objs = list(objs)
+        exc = [o for o in objs if o.except_of is not None and id(o.except_of) in self.given and o.keys()]
+        for o in exc:
+            for k in o.keys():
+                self.assigned.setdefault(k, []).append(("?except", self.text[o.a:o.b].strip(), 1.0))
+        rest = [o for o in objs if all(o is not e for e in exc)]
+        if rest:
+            self.prob("object_without_bin", "warning", "objects without a bin", rest)
 
     def _excepts(self, sent):
         """'everything except / but / apart from / other than X', 'everything that is not X': the X phrases (and-
@@ -827,6 +841,7 @@ class _Reader:
         if any(o.typo for o in spec) or bt.typo:
             conf *= 0.8
         a, b = _span(list(objs) + [bt])
+        self.given |= here
         for o in spec:
             v = "?except" if o.except_of is not None and id(o.except_of) in here else val
             for k in o.keys():
@@ -854,7 +869,7 @@ class _Reader:
         if self._zip(segs):
             self.header = None
             if prev_pend:
-                self.prob("object_without_bin", "warning", "objects without a bin", prev_pend)
+                self._unbound(prev_pend)
             return
         pend, pend_b = [], self.header     # [(phrase, before a colon)], a bin waiting for objects
         last_dir, last_objs, last_bo = None, [], None
@@ -887,7 +902,7 @@ class _Reader:
                     last_dir = "OB"
                 else:                                  # bin first: a bin takes the objects up to the next bin
                     if any(not h for _, h in pend):
-                        self.prob("object_without_bin", "warning", "objects without a bin", [o for o, _ in pend])
+                        self._unbound([o for o, _ in pend])
                     pend, bt, grp = [], None, []
                     for x in s["items"]:
                         if isinstance(x, BT):
@@ -943,7 +958,7 @@ class _Reader:
         if pend_b is not None and pend_b is not self.header:
             self.prob("bin_without_object", "warning", "bin without an object", [pend_b])
         if prev_pend:
-            self.prob("object_without_bin", "warning", "objects without a bin", prev_pend)
+            self._unbound(prev_pend)
         self.prev_pend = [o for o, _ in pend if o.keys()]
 
     def _zip(self, segs):
@@ -975,7 +990,7 @@ class _Reader:
 
     def result(self):
         if self.prev_pend:
-            self.prob("object_without_bin", "warning", "objects without a bin", self.prev_pend)
+            self._unbound(self.prev_pend)
         used = {v for vs in self.assigned.values() for v, _, _ in vs if v in BINS}
         free = [b for b in BINS if b not in used]
         keys, mapping, problems, dropped = [], {}, list(self.problems), []

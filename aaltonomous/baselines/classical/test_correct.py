@@ -105,13 +105,14 @@ class TestSettlePlan(_Fixture):
                                     if n != "settle"])
 
     def test_profiles(self):
-        """Base: on with the conservative robot values (dwell 9 + 3 + 6 ticks = 0.6 s); sim: 6 + 2 + 4 = 0.4 s;
+        """Base: on with the conservative robot values (dwell 12 + 3 + 6 ticks = 0.7 s; the dwell was 9 ticks until
+        the slower robot motion of 2026-11-14: grasp.correct.settle_s 0.4); sim: 6 + 2 + 4 = 0.4 s;
         sim_legacy (older mechanism tests) off; the oracle pins sim's."""
         from aaltonomous.sim.oracle import ORACLE_OVERRIDES
         base, legacy = load_config(profile="none"), load_config(profile="sim_legacy")
         self.assertTrue(base["grasp"]["correct"]["enabled"] and SIM["grasp"]["correct"]["enabled"])
         self.assertFalse(legacy["grasp"]["correct"]["enabled"])
-        self.assertEqual(correct_ticks(base["grasp"]["correct"]), (12, 6))
+        self.assertEqual(correct_ticks(base["grasp"]["correct"]), (15, 6))
         self.assertEqual(correct_ticks(SIM["grasp"]["correct"]), (8, 4))
         orc = load_config(profile="none", overrides=ORACLE_OVERRIDES)["grasp"]["correct"]
         self.assertEqual(orc, SIM["grasp"]["correct"])
